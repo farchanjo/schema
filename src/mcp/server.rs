@@ -134,12 +134,18 @@ impl From<ChunkRecord> for ToolChunk {
 }
 
 /// Server-side state shared by all tool handlers.
+///
+/// `store` and `embedder` are `Arc<...>` because the watcher consumer task
+/// (spawned in `main::run_serve`) needs read+write access in parallel with
+/// MCP tool handlers. Cloning the Arc is cheap; both layers see the same
+/// instances. The Mutex around `Embedder` serialises concurrent embed
+/// calls (fastembed's API requires `&mut self`).
 #[derive(Debug)]
 pub struct ServerState {
     pub config: SchemaConfig,
     pub identity: ProjectIdentity,
-    pub store: VectorStore,
-    pub embedder: Mutex<Embedder>,
+    pub store: Arc<VectorStore>,
+    pub embedder: Arc<Mutex<Embedder>>,
 }
 
 /// The MCP server instance.

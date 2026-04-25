@@ -75,11 +75,20 @@ fn init_tracing() {
 }
 
 async fn run_serve(config: PathBuf) -> Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use schema::config::{ProjectIdentity, SchemaConfig};
+    use schema::corpus::CorpusWatcher;
     use schema::embeddings::Embedder;
     use schema::mcp::ServerState;
-    use schema::retrieval::{DeltaSync, VectorStore};
+    use schema::retrieval::{
+        DeltaSync, VectorStore, WatcherConsumerInputs, corpus_paths_from_config,
+        run_watcher_consumer,
+    };
     use tokio::sync::Mutex;
+
+    const WATCHER_DEBOUNCE: Duration = Duration::from_millis(500);
 
     let cfg = SchemaConfig::load(&config)?;
     let identity =
@@ -91,25 +100,59 @@ async fn run_serve(config: PathBuf) -> Result<()> {
         "schema config loaded; cache resolved",
     );
 
-    // Initialise vector store + embedder.
-    let store = VectorStore::open(&identity.lance_dir).await?;
+    // Initialise vector store + embedder behind Arc so the watcher consumer
+    // task and the MCP tool handlers share the same instances.
+    let store = Arc::new(VectorStore::open(&identity.lance_dir).await?);
     store.ensure_table().await?;
-    let mut embedder = Embedder::new_bge_m3()?;
+    let embedder = Arc::new(Mutex::new(Embedder::new_bge_m3()?));
 
-    // Delta-sync the corpus before serving requests (per ADR-0007).
-    let sync = DeltaSync {
-        config: &cfg,
-        project_root: &identity.root,
-        metadata_path: &identity.metadata_path,
+    // Initial delta-sync (per ADR-0007).
+    {
+        let mut emb_guard = embedder.lock().await;
+        let sync = DeltaSync {
+            config: &cfg,
+            project_root: &identity.root,
+            metadata_path: &identity.metadata_path,
+        };
+        let report = sync.run(&store, &mut emb_guard).await?;
+        tracing::info!(?report, "initial delta-sync complete");
+    }
+
+    // Wire the in-session filesystem watcher (ADR-0010 + ADR-0007 evidence
+    // 2026-04-25). The watcher emits CorpusEvent on a tokio mpsc channel;
+    // run_watcher_consumer debounces them and triggers a delta-sync on
+    // each batch. The watcher's WatcherKeepAlive must outlive the consumer
+    // task — we move both into the same spawned task.
+    let watch_paths = corpus_paths_from_config(&cfg, &identity.root);
+    let watch_path_refs: Vec<&std::path::Path> = watch_paths.iter().map(AsRef::as_ref).collect();
+    let watcher = CorpusWatcher::new(&watch_path_refs)?;
+    let (keep_alive, events) = watcher.into_parts();
+
+    let consumer_inputs = WatcherConsumerInputs {
+        config: cfg.clone(),
+        project_root: identity.root.clone(),
+        metadata_path: identity.metadata_path.clone(),
+        store: Arc::clone(&store),
+        embedder: Arc::clone(&embedder),
+        debounce_window: WATCHER_DEBOUNCE,
     };
-    let report = sync.run(&store, &mut embedder).await?;
-    tracing::info!(?report, "initial delta-sync complete");
+    tokio::spawn(async move {
+        // Move the keep-alive into this task so the underlying notify
+        // watcher lives as long as the consumer.
+        let _watcher_alive = keep_alive;
+        run_watcher_consumer(consumer_inputs, events).await;
+    });
+    tracing::info!(
+        debounce_ms = u64::try_from(WATCHER_DEBOUNCE.as_millis()).unwrap_or(u64::MAX),
+        watched_paths = watch_paths.len(),
+        "in-session watcher consumer spawned",
+    );
 
     let state = ServerState {
         config: cfg,
         identity,
         store,
-        embedder: Mutex::new(embedder),
+        embedder,
     };
     SchemaServer::with_state(state).run_stdio().await
 }

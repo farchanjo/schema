@@ -161,7 +161,22 @@ edits).
 ## More information
 
 - `src/retrieval/metadata.rs` — manifest format + load/save.
-- `src/retrieval/sync.rs` — orchestrator.
+- `src/retrieval/sync.rs` — orchestrator + watcher consumer.
 - ADR-0008 — cache isolation (the manifest lives in the per-project
   cache dir).
 - ADR-0010 — file watcher (handles edits *during* a session).
+
+## Evidence and amendments
+
+- _2026-04-25 — Initial recording. Delta-sync only ran once, at
+  startup; in-session edits required a daemon restart to surface._
+- _2026-04-25 (FASE 1.0+) — Watcher consumer wired. The CorpusWatcher
+  events now feed a debounced (500 ms) tokio task that calls
+  `DeltaSync::run` on every burst. In-session edits are reflected
+  in the index within ~500 ms-2 s of an editor save. Implemented in
+  `src/retrieval/sync.rs::run_watcher_consumer` with the pure
+  debounce loop in `debounce_batch` (4 unit tests under
+  `tokio::time::pause()` cover the close, single-event, burst, and
+  partial-batch cases). The daemon now spawns a tokio task in
+  `main::run_serve` that owns the `WatcherKeepAlive` for the lifetime
+  of the consumer._

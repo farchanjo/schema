@@ -12,4 +12,7 @@ mod sync;
 
 pub use metadata::{FileMeta, Metadata};
 pub use store::{ChunkRecord, VectorStore, VectorStoreError};
-pub use sync::{DeltaSync, SyncReport};
+pub use sync::{
+    DeltaSync, SyncReport, WatcherConsumerInputs, corpus_paths_from_config, debounce_batch,
+    run_watcher_consumer,
+};

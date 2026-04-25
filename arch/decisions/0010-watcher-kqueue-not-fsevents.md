@@ -164,3 +164,17 @@ The current tool serves spec-only repos with hundreds of files.
 - `Cargo.toml` — feature config.
 - ADR-0007 — delta-sync layer (the consumer of watcher events).
 - `notify` docs: <https://docs.rs/notify/8.2.0/notify/>
+
+## Evidence and amendments
+
+- _2026-04-25 — Initial recording. Watcher implemented as
+  `CorpusWatcher` emitting `CorpusEvent` on a tokio mpsc channel,
+  but no consumer task was wired in FASE 1.0 — the channel had no
+  reader, so events were dropped silently._
+- _2026-04-25 (FASE 1.0+) — Consumer wired. `main::run_serve`
+  builds the `CorpusWatcher`, splits it via `into_parts()` into
+  a `WatcherKeepAlive` + `mpsc::Receiver<CorpusEvent>`, and
+  spawns a tokio task that owns both. The task runs
+  `run_watcher_consumer` (in `src/retrieval/sync.rs`), which
+  debounces events for 500 ms before calling `DeltaSync::run`.
+  See ADR-0007 evidence for the consumer details._

@@ -15,4 +15,4 @@ mod watcher;
 
 pub use chunker::{Chunk, Chunker, ChunkerError};
 pub use walker::{Walker, WalkerError};
-pub use watcher::{CorpusEvent, CorpusWatcher};
+pub use watcher::{CorpusEvent, CorpusWatcher, WatcherKeepAlive};
