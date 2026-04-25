@@ -39,8 +39,8 @@ fastembed = "5.13"
 
 # Vector store (LanceDB — embedded, columnar, MVCC)
 lancedb = "0.27"
-arrow-array = "55"
-arrow-schema = "55"
+arrow-array = "57"
+arrow-schema = "57"
 
 # Filesystem
 walkdir = "2.5"
