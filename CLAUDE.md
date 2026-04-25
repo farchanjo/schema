@@ -1,0 +1,133 @@
+# CLAUDE.md — mcp-schema
+
+> Claude Code working directory instructions for `~/dev/mcp-schema/`.
+
+## What this repo is
+
+`schema` is a Rust binary implementing an MCP server (Model Context Protocol) that indexes
+project documentation (ADRs, OpenAPI, CUE, glossaries, markdown) and exposes retrieval tools
+to LLM clients via stdio. It is **multi-project**: one binary, any number of consumer repos
+declaring their corpus via `schema.toml`.
+
+This repo's own `arch/` directory documents architectural decisions about the tool itself —
+not Lowcow's business decisions. ADRs that govern Lowcow live in `~/dev/lowcow-platform/`.
+
+## Operating mode
+
+- **Sole operator**: Fabricio Archanjo. Converse before acting on non-obvious changes.
+- **Toolchain**: Rust 1.95.0 (Edition 2024) pinned via `rust-toolchain.toml` and `.mise.toml`.
+- **Language policy**: en-US for every artifact written into this repo (code, comments, docs,
+  ADRs, commit messages, branch names). Console replies follow the user's chat language.
+
+## Repo layout
+
+```text
+mcp-schema/
+├── Cargo.toml                  Rust manifest (verified versions only)
+├── rust-toolchain.toml         pinned Rust 1.95.0
+├── .mise.toml                  pinned via mise
+├── src/                        ★ MCP server source (root of the binary)
+│   ├── main.rs                 CLI entry (clap)
+│   ├── lib.rs                  re-exports
+│   ├── mcp/                    rmcp wiring
+│   ├── corpus/                 walker + chunkers
+│   ├── embeddings/             fastembed bge-m3
+│   ├── retrieval/              LanceDB + delta-sync
+│   ├── config/                 schema.toml loader
+│   └── tools/                  MCP tool implementations
+├── tests/                      cargo integration tests
+├── arch/                       ★ docs about THIS tool (not Lowcow)
+│   ├── decisions/              ADRs (MADR + Y-statement)
+│   └── operations/             runbook
+├── examples/                   sample schema.toml per consumer
+├── data/                       (gitignored, not used in repo — moved to ~/.cache/schema/)
+└── target/                     (gitignored, cargo build artifacts)
+```
+
+## Toolchain (pinned)
+
+| Tool       | Version   | Source           |
+| ---------- | --------- | ---------------- |
+| Rust       | 1.95.0    | `rust-toolchain.toml`, mise |
+| Cargo      | bundled   | with rustc       |
+| rustfmt    | bundled   | rust-toolchain components |
+| clippy     | bundled   | rust-toolchain components |
+
+## Common commands
+
+```bash
+mise install                    # install pinned Rust 1.95.0
+cargo build                     # debug build
+cargo build --release           # release build (LTO, stripped)
+cargo test                      # all tests
+cargo fmt --all                 # format
+cargo fmt --all -- --check      # CI-style format check
+cargo clippy --all-targets --all-features -- -D warnings   # lint, warn = error
+cargo install --path .          # install schema to PATH
+
+# After install:
+schema --version
+schema validate --config /path/to/project/schema.toml
+schema serve --config /path/to/project/schema.toml
+```
+
+## Coding conventions
+
+- Methods < 30 lines, no dead code, no duplication, SOLID where it fits.
+- en-US identifiers, comments, and error messages.
+- `anyhow::Result` for application errors; `thiserror` for library errors that need
+  matching by callers.
+- `tracing` for logs; never `println!` in production paths (only in `main` for CLI output).
+- Follow `cargo fmt` defaults; clippy warnings = errors in CI.
+- Public API doc-comments use `///`; internal explanatory notes use `//`.
+- Tests near code: `#[cfg(test)] mod tests { ... }` or `tests/` for integration.
+
+## Commit conventions (Angular-flavored)
+
+```
+<type>(<scope>): <subject>
+
+Common types: feat, fix, docs, chore, refactor, test, perf
+Common scopes: mcp, corpus, embeddings, retrieval, tools, config, integration
+```
+
+Examples:
+
+- `feat(mcp): rmcp server skeleton + ping tool`
+- `feat(retrieval): delta-sync on startup`
+- `docs(arch): ADR-0010 watcher uses kqueue not FSEvents`
+
+## ADR conventions
+
+ADRs live in `arch/decisions/`. Format: MADR 4.0 + Y-statement (Olaf Zimmermann).
+
+- Filename: `NNNN-short-title.md` (e.g., `0001-rust-cargo-mcp.md`).
+- Numbered sequentially; never re-used.
+- Frontmatter includes `status`, `date`, `decision-makers`, `review-due`.
+- Y-statement at the top: "In the context of X, facing Y, we decided Z and against W to
+  achieve A, accepting B."
+- Fitness function at the bottom — points to a CUE constraint, Conftest policy, CI check,
+  or test that proves the decision is still in effect.
+
+## What NOT to do
+
+- ❌ Do not edit `Cargo.lock` by hand.
+- ❌ Do not introduce network calls in test code (model download must be mocked).
+- ❌ Do not commit `target/`, `~/.cache/schema/`, or model weights.
+- ❌ Do not add a dependency without verifying the version against
+  `https://crates.io/api/v1/crates/<name>` for the latest stable.
+- ❌ Do not bypass `cargo clippy` warnings — fix them or document why with `#[allow(...)]`
+  and a comment explaining the rationale.
+
+## What to ask before doing
+
+- Adding a new MCP tool that mutates filesystem outside the cache dir.
+- Adding a runtime dependency over 5 MB compiled.
+- Changing the embedding model from BGE-M3.
+- Changing the cache layout (would break existing consumer projects).
+- Pulling in `unsafe` Rust.
+
+## Math policy
+
+When reasoning about file sizes, durations, or any arithmetic in conversation, use the
+`arithma` calculator MCP — never compute mentally or inline.

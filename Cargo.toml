@@ -1,0 +1,81 @@
+[package]
+name = "schema"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "Apache-2.0"
+description = "MCP server for indexing project specs, ADRs, contracts, and glossaries via local RAG (bge-m3 + LanceDB)"
+authors = ["Fabricio Archanjo <farchanjo@gmail.com>"]
+repository = "https://github.com/archanjoeti/mcp-schema"
+readme = "README.md"
+keywords = ["mcp", "rag", "embeddings", "adr", "specs"]
+categories = ["development-tools", "command-line-utilities"]
+
+[[bin]]
+name = "schema"
+path = "src/main.rs"
+
+[dependencies]
+# MCP — Model Context Protocol Rust SDK
+rmcp = { version = "1.5", features = ["server", "macros"] }
+
+# Async runtime
+tokio = { version = "1.52", features = ["full"] }
+futures = "0.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Embeddings (bge-m3 via ort/ONNX Runtime)
+fastembed = "5.13"
+
+# Vector store (LanceDB — embedded, columnar, MVCC)
+lancedb = "0.27"
+arrow-array = "55"
+arrow-schema = "55"
+
+# Filesystem
+walkdir = "2.5"
+fd-lock = "4.0"
+dirs = "6"
+
+# Markdown + config
+pulldown-cmark = "0.13"
+toml = "1.1"
+
+# Time + hashing
+chrono = { version = "0.4", features = ["serde"] }
+blake3 = "1.8"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Filesystem watcher — kqueue on macOS (per ADR-0010); inotify is the
+# automatic Linux backend (no feature flag needed; not exposed as one in
+# notify 8.x). On Linux we accept defaults.
+[target.'cfg(target_os = "macos")'.dependencies.notify]
+version = "8.2"
+default-features = false
+features = ["macos_kqueue"]
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+notify = "8.2"
+
+[dev-dependencies]
+tempfile = "3.27"
+insta = { version = "1.47", features = ["yaml"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

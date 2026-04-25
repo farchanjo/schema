@@ -1,0 +1,5 @@
+# Pinned tool versions for the mcp-schema repo.
+# Local dev: `mise install` after cloning.
+
+[tools]
+rust = "1.95.0"
