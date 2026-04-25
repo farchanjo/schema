@@ -77,8 +77,9 @@ On the first `schema serve` for any project:
 - `bge-m3` ONNX weights (~2 GB) download to
   `~/.cache/schema/models/`. Subsequent runs (any project) reuse
   the cache.
-- LanceDB initialises an empty `chunks` table at
-  `~/.cache/schema/projects/<id>/lance/`.
+- The SQLite + `sqlite-vec` store initialises an empty `chunks`
+  table at `~/.cache/schema/projects/<id>/store.db` (with WAL
+  companions `store.db-wal` and `store.db-shm`).
 - Initial embedding pass embeds every declared file. Expect
   ~20-60 s for ~150 files on M-series.
 
@@ -95,11 +96,14 @@ RUST_LOG=info schema serve --config schema.toml 2>schema.log
 
 Common log lines:
 
-- `opening LanceDB` — store initialised.
-- `lance table created` — first run, table did not exist.
+- `opening sqlite-vec store` — store initialised.
+- `sqlite-vec schema ensured` — first run, tables did not exist.
 - `initialising bge-m3 embedder (downloads on first run)` — model
   load.
 - `delta-sync complete total=X ...` — startup sync done.
+- `legacy LanceDB cache directory detected; safe to delete after
+  confirming the sqlite-vec store works` — first spawn after
+  upgrading from a pre-ADR-0011 binary; manual cleanup expected.
 
 ## Cache layout
 
@@ -109,7 +113,9 @@ Common log lines:
 │   └── bge-m3/                     # ~2 GB ONNX weights
 └── projects/
     └── <project-name>-<hash>/
-        ├── lance/                  # LanceDB store
+        ├── store.db                # SQLite + sqlite-vec store
+        ├── store.db-wal            # WAL journal
+        ├── store.db-shm            # WAL shared memory
         ├── metadata.toml           # delta-sync manifest
         └── lock                    # advisory lock (FASE 1.1)
 ```
@@ -212,16 +218,28 @@ git pull
 cargo install --path . --force
 ```
 
-LanceDB schema migrations (FASE 1.1) run automatically on first
-spawn after upgrade. If migration fails, the runbook migration
-section will be added.
+**Upgrading across ADR-0011 (LanceDB → sqlite-vec):** the new
+binary creates a fresh `store.db` and ignores any pre-existing
+`lance/` directory. A `tracing::warn!` line on first spawn names
+the legacy path; delete it manually once you have confirmed the
+new store works:
+
+```bash
+rm -rf ~/.cache/schema/projects/<project-name>-<hash>/lance
+```
+
+(Cache migration follow-up tracked in ADR-0011.)
+
+SQLite schema migrations (FASE 1.1+) will run automatically on
+first spawn after future upgrades.
 
 ## Health check (FASE 1.1)
 
 Planned `schema doctor --config schema.toml` will check:
 
 - Model weights present + valid.
-- LanceDB store openable.
+- SQLite + `sqlite-vec` store openable (vec0 + FTS5 virtual
+  tables present).
 - Manifest parseable.
 - File watcher can watch the corpus paths.
 
@@ -230,7 +248,7 @@ Until then, manual checks:
 ```bash
 schema validate --config schema.toml
 ls -lh ~/.cache/schema/models/
-ls -lh ~/.cache/schema/projects/<id>/lance/
+ls -lh ~/.cache/schema/projects/<id>/store.db
 ```
 
 ## Uninstall
