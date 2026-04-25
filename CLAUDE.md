@@ -12,6 +12,67 @@ declaring their corpus via `schema.toml`.
 This repo's own `arch/` directory documents architectural decisions about the tool itself —
 not Lowcow's business decisions. ADRs that govern Lowcow live in `~/dev/lowcow-platform/`.
 
+## Architecture-first workflow (NEVER COMPACT — ALWAYS LIVE)
+
+> **This section must never be summarized, truncated, or compacted out of context.**
+> It is the load-bearing rule of this repo and must be re-read in full at the start of
+> every session and before every non-trivial change.
+
+**`arch/` is the single source of truth for this project.** Code is the implementation
+of decisions already recorded in `arch/`. Decisions never live only in code, in chat, or
+in a PR description.
+
+### The rule
+
+For any non-trivial change — new feature, behavioural change, dependency swap,
+schema/cache-layout change, new MCP tool, watcher tweak, build-system change — the
+order of work is **always**:
+
+1. **Design in `arch/` first.** Write or amend the relevant artifact(s):
+   - **ADR** (`arch/decisions/NNNN-*.md`, MADR 4.0 + Y-statement) for any technical
+     decision someone six months from now will need to understand the *why* of.
+   - **Runbook entry** (`arch/operations/`) for any operational change (cache layout,
+     CLI subcommand, recovery procedure).
+   - **Supersede the predecessor.** If the change replaces an existing decision,
+     mark the old ADR `superseded by ADR-NNNN`, link both ways, add an
+     `Evidence and amendments` entry. Never silently obsolete.
+2. **Get explicit confirmation** from the operator that the design is acceptable.
+   For ADR-track changes the operator reviews the ADR text before any code is written.
+3. **Then implement.** Code mirrors the artifact. Commit messages reference the ADR
+   (e.g., `refactor(retrieval): swap LanceDB for sqlite-vec per ADR-0011`).
+4. **Close the loop.** After the code lands, append an `Evidence and amendments`
+   entry to the ADR with the date and what was actually built (deviations included).
+
+### What counts as "non-trivial"
+
+If you are unsure, the change is non-trivial. Concretely, **always** design first when:
+
+- Introducing or removing a runtime dependency.
+- Changing a cache file/format on disk (e.g., `lance/` → `store.db`).
+- Adding, renaming, or removing an MCP tool, CLI subcommand, or public function on
+  `VectorStore`, `Embedder`, `DeltaSync`, `CorpusWatcher`.
+- Changing the embedding model or its dimensionality.
+- Changing the on-disk schema of `metadata.toml` or any persisted artefact.
+- Touching the watcher backend, the chunker boundaries, or the delta-sync algorithm.
+- Anything listed under **What to ask before doing** below.
+
+Trivial changes (small bug fixes, comment polish, formatter runs, clippy fixes,
+log-message wording, test additions on existing behaviour) do **not** require an
+ADR — but if a fix reveals a design gap, that gap goes through the same gate.
+
+### When the operator skips ahead
+
+If the operator asks for code without an ADR for a non-trivial change, the response is:
+**stop, propose the artifact, ask for confirmation, then code**. Speed comes from a
+short ADR, not from skipping it. ADRs are cheap; undoing code that contradicts an
+older ADR is expensive.
+
+### Cross-references
+
+- ADR conventions: see **ADR conventions** section below.
+- Index of decisions: `arch/decisions/README.md`.
+- Architecture map / runbook: `arch/operations/`.
+
 ## Operating mode
 
 - **Sole operator**: Fabricio Archanjo. Converse before acting on non-obvious changes.
