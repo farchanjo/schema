@@ -43,6 +43,39 @@ pub struct QueryParams {
     pub top_k: Option<usize>,
 }
 
+/// Arguments for `find_decisions` — semantic search restricted to ADR-MADR.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindDecisionsParams {
+    /// What you want to find decisions about (e.g. "session lifetime",
+    /// "step-up authentication").
+    pub query: String,
+
+    #[serde(default)]
+    pub top_k: Option<usize>,
+}
+
+/// Arguments for `glossary_lookup` — semantic search restricted to glossary kinds.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GlossaryLookupParams {
+    /// Term to look up. The match is semantic, so synonyms work
+    /// (e.g. "RBAC" finds "role-based access control").
+    pub term: String,
+
+    #[serde(default)]
+    pub top_k: Option<usize>,
+}
+
+/// Empty parameter set — `list_corpus` takes no arguments.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListCorpusParams {}
+
+/// Result of `list_corpus`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CorpusListing {
+    pub project: String,
+    pub source_paths: Vec<String>,
+}
+
 /// One row of a query response.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ToolChunk {
@@ -103,14 +136,73 @@ impl SchemaServer {
         description = "Generic top-K semantic search over the project's indexed corpus. Returns the closest chunks (with source path + line range) for a natural-language query."
     )]
     async fn query(&self, Parameters(params): Parameters<QueryParams>) -> String {
-        match self.run_query(&params).await {
-            Ok(chunks) => match serde_json::to_string(&chunks) {
-                Ok(json) => json,
-                Err(e) => format!("{{\"error\": \"serialise: {e}\"}}"),
-            },
-            Err(e) => format!("{{\"error\": \"{e}\"}}"),
+        match self.run_query(&params.query, params.top_k, None).await {
+            Ok(chunks) => json_or_error(&chunks),
+            Err(e) => format_error(&format!("{e}")),
         }
     }
+
+    /// Semantic search restricted to ADRs (kind = adr-madr).
+    #[tool(
+        description = "Top-K semantic search restricted to architectural decisions (ADRs). Use when you specifically want decisions and their rationale, not general docs."
+    )]
+    async fn find_decisions(&self, Parameters(params): Parameters<FindDecisionsParams>) -> String {
+        match self
+            .run_query(&params.query, params.top_k, Some("AdrMadr"))
+            .await
+        {
+            Ok(chunks) => json_or_error(&chunks),
+            Err(e) => format_error(&format!("{e}")),
+        }
+    }
+
+    /// Term lookup restricted to glossary entries.
+    #[tool(
+        description = "Look up a term in the project's glossary. Returns the closest matching glossary chunks (semantic match, so synonyms and related terms surface)."
+    )]
+    async fn glossary_lookup(
+        &self,
+        Parameters(params): Parameters<GlossaryLookupParams>,
+    ) -> String {
+        match self
+            .run_query(&params.term, params.top_k, Some("Glossary"))
+            .await
+        {
+            Ok(chunks) => json_or_error(&chunks),
+            Err(e) => format_error(&format!("{e}")),
+        }
+    }
+
+    /// Debug — list every distinct source path indexed for this project.
+    #[tool(
+        description = "List every source file currently in the project's index. Useful for verifying what schema sees vs what the project ships."
+    )]
+    async fn list_corpus(&self, _params: Parameters<ListCorpusParams>) -> String {
+        match self.state.store.list_source_paths().await {
+            Ok(paths) => {
+                let listing = CorpusListing {
+                    project: self.state.config.project.name.clone(),
+                    source_paths: paths,
+                };
+                json_or_error(&listing)
+            }
+            Err(e) => format_error(&format!("{e}")),
+        }
+    }
+}
+
+/// Serialise any `Serialize` value to JSON; on failure return a JSON-encoded
+/// error string suitable for the MCP response slot.
+fn json_or_error<T: Serialize>(value: &T) -> String {
+    match serde_json::to_string(value) {
+        Ok(json) => json,
+        Err(e) => format_error(&format!("serialise: {e}")),
+    }
+}
+
+fn format_error(message: &str) -> String {
+    let escaped = message.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("{{\"error\":\"{escaped}\"}}")
 }
 
 impl SchemaServer {
@@ -130,18 +222,25 @@ impl SchemaServer {
         Ok(())
     }
 
-    async fn run_query(&self, params: &QueryParams) -> anyhow::Result<Vec<ToolChunk>> {
-        let top_k = params
-            .top_k
-            .unwrap_or(self.state.config.retrieval.top_k_default);
+    async fn run_query(
+        &self,
+        query_text: &str,
+        top_k_override: Option<usize>,
+        kind_filter: Option<&str>,
+    ) -> anyhow::Result<Vec<ToolChunk>> {
+        let top_k = top_k_override.unwrap_or(self.state.config.retrieval.top_k_default);
         let vector = {
             let mut emb = self.state.embedder.lock().await;
-            let mut vectors = emb.embed(vec![params.query.as_str()], None)?;
+            let mut vectors = emb.embed(vec![query_text], None)?;
             vectors
                 .pop()
                 .ok_or_else(|| anyhow::anyhow!("embedder returned no vectors"))?
         };
-        let records = self.state.store.query_nearest(&vector, top_k, None).await?;
+        let records = self
+            .state
+            .store
+            .query_nearest(&vector, top_k, kind_filter)
+            .await?;
         Ok(records.into_iter().map(ToolChunk::from).collect())
     }
 }
