@@ -4,10 +4,10 @@
 //! parses that TOML, resolves the project's stable identifier, and computes
 //! the cache directory under `~/.cache/schema/projects/<id>/`.
 
-mod project;
+pub mod project;
 mod schema_toml;
 
-pub use project::{ProjectId, ProjectIdentity};
+pub use project::{ProjectId, ProjectIdentity, cache_root};
 pub use schema_toml::{
     Corpus, CorpusKind, EmbeddingConfig, ProjectMeta, RetrievalConfig, SchemaConfig, SecurityConfig,
 };
