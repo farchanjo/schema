@@ -76,6 +76,35 @@ pub struct CorpusListing {
     pub source_paths: Vec<String>,
 }
 
+/// Arguments for `cross_reference` — given an artifact id, find chunks that
+/// define it and chunks that reference it.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CrossReferenceParams {
+    /// Artifact identifier, e.g. `"ADR-0055"`. Matched exactly against
+    /// the `artifact_id` column for definitional hits, and against
+    /// `content LIKE '%id%'` (excluding the artifact's own chunks) for
+    /// referencing hits.
+    pub artifact_id: String,
+
+    /// Cap on returned definitional chunks. Default 16.
+    #[serde(default)]
+    pub definition_limit: Option<usize>,
+
+    /// Cap on returned referencing chunks. Default 32.
+    #[serde(default)]
+    pub reference_limit: Option<usize>,
+}
+
+/// Two-sided result returned by `cross_reference`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CrossReferenceResult {
+    /// Chunks whose `artifact_id` matches exactly.
+    pub definition: Vec<ToolChunk>,
+    /// Chunks whose content mentions the artifact id (excluding the
+    /// artifact's own chunks).
+    pub references: Vec<ToolChunk>,
+}
+
 /// One row of a query response.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
 pub struct ToolChunk {
@@ -171,6 +200,36 @@ impl SchemaServer {
             Ok(chunks) => json_or_error(&chunks),
             Err(e) => format_error(&format!("{e}")),
         }
+    }
+
+    /// Cross-reference: artifact id → definition + referencing chunks.
+    #[tool(
+        description = "Given an artifact id (e.g. \"ADR-0055\"), return both the chunks that define it (artifact_id match) and chunks that mention it elsewhere (content match). Useful for navigating decision relationships and impact analysis."
+    )]
+    async fn cross_reference(
+        &self,
+        Parameters(params): Parameters<CrossReferenceParams>,
+    ) -> String {
+        let def_limit = params.definition_limit.unwrap_or(16);
+        let ref_limit = params.reference_limit.unwrap_or(32);
+
+        let store = &self.state.store;
+        let definition = match store
+            .find_by_artifact_id(&params.artifact_id, def_limit)
+            .await
+        {
+            Ok(records) => records.into_iter().map(ToolChunk::from).collect(),
+            Err(e) => return format_error(&format!("definition lookup failed: {e}")),
+        };
+        let references = match store.find_mentioning(&params.artifact_id, ref_limit).await {
+            Ok(records) => records.into_iter().map(ToolChunk::from).collect(),
+            Err(e) => return format_error(&format!("references lookup failed: {e}")),
+        };
+
+        json_or_error(&CrossReferenceResult {
+            definition,
+            references,
+        })
     }
 
     /// Debug — list every distinct source path indexed for this project.

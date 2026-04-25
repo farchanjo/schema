@@ -152,6 +152,59 @@ impl VectorStore {
         Ok(out)
     }
 
+    /// Find every chunk whose `artifact_id` exactly matches the given id
+    /// (e.g., `"ADR-0055"`). Used by `cross_reference` to surface the
+    /// artifact's own definitional chunks.
+    pub async fn find_by_artifact_id(
+        &self,
+        artifact_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ChunkRecord>, VectorStoreError> {
+        let table = self.conn.open_table(TABLE_NAME).execute().await?;
+        let predicate = format!("artifact_id = '{}'", artifact_id.replace('\'', "''"));
+        let mut stream = table
+            .query()
+            .only_if(predicate)
+            .limit(limit)
+            .execute()
+            .await?;
+
+        let mut out = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            out.extend(batch_to_records(&batch)?);
+        }
+        Ok(out)
+    }
+
+    /// Find every chunk whose `content` mentions the given substring
+    /// (case-sensitive `LIKE '%needle%'`). Used by `cross_reference` to
+    /// surface chunks that reference an artifact id without being the
+    /// artifact itself.
+    pub async fn find_mentioning(
+        &self,
+        needle: &str,
+        limit: usize,
+    ) -> Result<Vec<ChunkRecord>, VectorStoreError> {
+        let table = self.conn.open_table(TABLE_NAME).execute().await?;
+        let predicate = format!(
+            "content LIKE '%{}%' AND (artifact_id IS NULL OR artifact_id != '{}')",
+            needle.replace('\'', "''"),
+            needle.replace('\'', "''"),
+        );
+        let mut stream = table
+            .query()
+            .only_if(predicate)
+            .limit(limit)
+            .execute()
+            .await?;
+
+        let mut out = Vec::new();
+        while let Some(batch) = stream.try_next().await? {
+            out.extend(batch_to_records(&batch)?);
+        }
+        Ok(out)
+    }
+
     /// List every distinct `source_path` currently in the index.
     pub async fn list_source_paths(&self) -> Result<Vec<String>, VectorStoreError> {
         let table = self.conn.open_table(TABLE_NAME).execute().await?;
