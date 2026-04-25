@@ -1,4 +1,10 @@
 //! `schema` library — internals exposed to integration tests and the binary entry.
+//!
+//! Layout follows ADR-0013 (hexagonal-lite):
+//! - [`domain`] — pure types
+//! - [`ports`]  — async/sync trait boundaries
+//! - [`app`]    — orchestration services depending only on `domain` + `ports`
+//! - [`adapters`] — concrete adapters implementing the ports
 
 #![allow(
     unused_crate_dependencies,
@@ -9,8 +15,7 @@
               lib build. Layer C `deny` for this lint stays — only narrowed here."
 )]
 
-pub mod config;
-pub mod corpus;
-pub mod embeddings;
-pub mod mcp;
-pub mod retrieval;
+pub mod adapters;
+pub mod app;
+pub mod domain;
+pub mod ports;

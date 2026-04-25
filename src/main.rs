@@ -12,55 +12,78 @@
 )]
 
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{Arg, ArgMatches, Command};
+use tokio::sync::Mutex;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
-use schema::mcp::SchemaServer;
+use schema::adapters::fastembed_embedder::FastembedEmbedder;
+use schema::adapters::filesystem::{NotifyWatcher, WalkdirWalker};
+use schema::adapters::markdown_chunker::MarkdownChunker;
+use schema::adapters::mcp_server::{SchemaServer, ServerState};
+use schema::adapters::metadata_store::TomlMetadataStore;
+use schema::adapters::project_identity::ProjectIdentity;
+use schema::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_dir};
+use schema::adapters::toml_config::SchemaConfig;
+use schema::app::delta_sync::{DeltaSync, corpus_paths_from_config};
+use schema::app::query::Query;
+use schema::app::watcher_consumer::run_watcher_consumer;
+use schema::ports::{Chunker, Embedder, MetadataStore, Persistence, Walker, Watcher};
 
-/// Top-level CLI. Run with no subcommand to start the MCP server (default).
-#[derive(Parser, Debug)]
-#[command(
-    name = "schema",
-    version,
-    about = "MCP server for indexing project specs, ADRs, and contracts",
-    long_about = None,
-)]
-struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
+const WATCHER_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Build the top-level CLI definition using the clap builder API.
+///
+/// We use the builder rather than `#[derive(Parser)]` because clap's derive
+/// emits `#[allow(clippy::restriction)]` on its expansion, which is
+/// incompatible with the restriction-group lints set to `forbid` by ADR-0012
+/// (E0453: forbid cannot be downgraded).
+fn cli() -> Command {
+    let config_arg = Arg::new("config")
+        .long("config")
+        .value_name("PATH")
+        .value_parser(clap::value_parser!(PathBuf))
+        .default_value("schema.toml");
+
+    Command::new("schema")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("MCP server for indexing project specs, ADRs, and contracts")
+        .subcommand_required(false)
+        .arg_required_else_help(false)
+        .subcommand(
+            Command::new("serve")
+                .about("Start the MCP server over stdio.")
+                .arg(config_arg.clone()),
+        )
+        .subcommand(
+            Command::new("validate")
+                .about("Validate a `schema.toml` without starting the MCP server.")
+                .arg(config_arg),
+        )
 }
 
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Start the MCP server over stdio.
-    Serve {
-        /// Path to the project's `schema.toml`. Defaults to `./schema.toml`.
-        #[arg(long, value_name = "PATH", default_value = "schema.toml")]
-        config: PathBuf,
-    },
-
-    /// Validate a `schema.toml` without starting the MCP server.
-    Validate {
-        /// Path to the project's `schema.toml`.
-        #[arg(long, value_name = "PATH", default_value = "schema.toml")]
-        config: PathBuf,
-    },
+fn config_from(matches: &ArgMatches) -> PathBuf {
+    matches
+        .get_one::<PathBuf>("config")
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("schema.toml"))
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
 
-    let cli = Cli::parse();
+    let matches = cli().get_matches();
 
-    match cli.command.unwrap_or(Command::Serve {
-        config: PathBuf::from("schema.toml"),
-    }) {
-        Command::Serve { config } => run_serve(config).await,
-        Command::Validate { config } => run_validate(config),
+    match matches.subcommand() {
+        Some(("serve", sub)) => run_serve(config_from(sub)).await,
+        Some(("validate", sub)) => run_validate(&config_from(sub)),
+        Some((other, _)) => Err(anyhow::anyhow!("unknown subcommand: {other}")),
+        None => run_serve(PathBuf::from("schema.toml")).await,
     }
 }
 
@@ -74,22 +97,63 @@ fn init_tracing() {
         .init();
 }
 
+/// Bundle of port handles wired up for one project.
+struct Wiring {
+    persistence: Arc<dyn Persistence>,
+    embedder: Arc<Mutex<dyn Embedder>>,
+    walker: Arc<dyn Walker>,
+    chunker: Arc<dyn Chunker>,
+    metadata: Arc<dyn MetadataStore>,
+}
+
+async fn wire_ports(cfg: &SchemaConfig, identity: &ProjectIdentity) -> Result<Wiring> {
+    // Persistence: SqliteVecStore (ADR-0011).
+    migrate_legacy_lance_dir(&identity.cache_dir);
+    let persistence: Arc<dyn Persistence> =
+        Arc::new(SqliteVecStore::open(&identity.store_path).await?);
+    persistence.ensure_ready().await?;
+
+    // Embedder: fastembed BGE-M3 (ADR-0005).
+    let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3()?));
+
+    // Walker + Chunker + MetadataStore — all sync, all wrapped in Arc<dyn>.
+    let cfg_arc = Arc::new(cfg.clone());
+    let walker: Arc<dyn Walker> = Arc::new(WalkdirWalker::new(cfg_arc, identity.root.clone()));
+    let chunker: Arc<dyn Chunker> = Arc::new(MarkdownChunker::new(cfg.retrieval.chunk_size_max));
+    let metadata: Arc<dyn MetadataStore> =
+        Arc::new(TomlMetadataStore::new(identity.metadata_path.clone()));
+
+    Ok(Wiring {
+        persistence,
+        embedder,
+        walker,
+        chunker,
+        metadata,
+    })
+}
+
+/// Built application services for one running session.
+struct Services {
+    sync: DeltaSync,
+    query: Query,
+}
+
+fn build_services(wiring: &Wiring) -> Services {
+    let sync = DeltaSync::new(
+        Arc::clone(&wiring.persistence),
+        Arc::clone(&wiring.embedder),
+        Arc::clone(&wiring.walker),
+        Arc::clone(&wiring.chunker),
+        Arc::clone(&wiring.metadata),
+    );
+    let query = Query::new(
+        Arc::clone(&wiring.persistence),
+        Arc::clone(&wiring.embedder),
+    );
+    Services { sync, query }
+}
+
 async fn run_serve(config: PathBuf) -> Result<()> {
-    use std::sync::Arc;
-    use std::time::Duration;
-
-    use schema::config::{ProjectIdentity, SchemaConfig};
-    use schema::corpus::CorpusWatcher;
-    use schema::embeddings::Embedder;
-    use schema::mcp::ServerState;
-    use schema::retrieval::{
-        DeltaSync, VectorStore, WatcherConsumerInputs, corpus_paths_from_config,
-        run_watcher_consumer,
-    };
-    use tokio::sync::Mutex;
-
-    const WATCHER_DEBOUNCE: Duration = Duration::from_millis(500);
-
     let cfg = SchemaConfig::load(&config)?;
     let identity =
         ProjectIdentity::resolve(&cfg.project.name, &SchemaConfig::project_root(&config)?)?;
@@ -100,69 +164,47 @@ async fn run_serve(config: PathBuf) -> Result<()> {
         "schema config loaded; cache resolved",
     );
 
-    // Initialise vector store + embedder behind Arc so the watcher consumer
-    // task and the MCP tool handlers share the same instances.
-    let store = Arc::new(VectorStore::open(&identity.lance_dir).await?);
-    store.ensure_table().await?;
-    let embedder = Arc::new(Mutex::new(Embedder::new_bge_m3()?));
+    let wiring = wire_ports(&cfg, &identity).await?;
+    let Services { sync, query } = build_services(&wiring);
 
-    // Initial delta-sync (per ADR-0007).
-    {
-        let mut emb_guard = embedder.lock().await;
-        let sync = DeltaSync {
-            config: &cfg,
-            project_root: &identity.root,
-            metadata_path: &identity.metadata_path,
-        };
-        let report = sync.run(&store, &mut emb_guard).await?;
-        tracing::info!(?report, "initial delta-sync complete");
-    }
+    let initial = sync.run().await?;
+    tracing::info!(?initial, "initial delta-sync complete");
 
-    // Wire the in-session filesystem watcher (ADR-0010 + ADR-0007 evidence
-    // 2026-04-25). The watcher emits CorpusEvent on a tokio mpsc channel;
-    // run_watcher_consumer debounces them and triggers a delta-sync on
-    // each batch. The watcher's WatcherKeepAlive must outlive the consumer
-    // task — we move both into the same spawned task.
-    let watch_paths = corpus_paths_from_config(&cfg, &identity.root);
-    let watch_path_refs: Vec<&std::path::Path> = watch_paths.iter().map(AsRef::as_ref).collect();
-    let watcher = CorpusWatcher::new(&watch_path_refs)?;
-    let (keep_alive, events) = watcher.into_parts();
+    spawn_watcher(&cfg, &identity, sync.clone())?;
 
-    let consumer_inputs = WatcherConsumerInputs {
-        config: cfg.clone(),
-        project_root: identity.root.clone(),
-        metadata_path: identity.metadata_path.clone(),
-        store: Arc::clone(&store),
-        embedder: Arc::clone(&embedder),
-        debounce_window: WATCHER_DEBOUNCE,
+    let state = ServerState {
+        config: cfg,
+        identity,
+        query,
     };
+    SchemaServer::with_state(state).run_stdio().await
+}
+
+/// Wire the in-session filesystem watcher (ADR-0010 + ADR-0007 evidence
+/// 2026-04-25): debounce `CorpusEvent`s and trigger delta-syncs on each batch.
+fn spawn_watcher(cfg: &SchemaConfig, identity: &ProjectIdentity, sync: DeltaSync) -> Result<()> {
+    let watch_paths = corpus_paths_from_config(cfg, &identity.root);
+    let watcher: Box<dyn Watcher> = Box::new(NotifyWatcher::new(watch_paths.clone()));
+    let (keep_alive, events) = watcher.start()?;
+
     tokio::spawn(async move {
         // Move the keep-alive into this task so the underlying notify
         // watcher lives as long as the consumer.
         let _watcher_alive = keep_alive;
-        run_watcher_consumer(consumer_inputs, events).await;
+        run_watcher_consumer(sync, WATCHER_DEBOUNCE, events).await;
     });
     tracing::info!(
         debounce_ms = u64::try_from(WATCHER_DEBOUNCE.as_millis()).unwrap_or(u64::MAX),
         watched_paths = watch_paths.len(),
         "in-session watcher consumer spawned",
     );
-
-    let state = ServerState {
-        config: cfg,
-        identity,
-        store,
-        embedder,
-    };
-    SchemaServer::with_state(state).run_stdio().await
+    Ok(())
 }
 
-fn run_validate(config: PathBuf) -> Result<()> {
-    use schema::config::{ProjectIdentity, SchemaConfig};
-
-    let cfg = SchemaConfig::load(&config)?;
+fn run_validate(config: &Path) -> Result<()> {
+    let cfg = SchemaConfig::load(config)?;
     let identity =
-        ProjectIdentity::resolve(&cfg.project.name, &SchemaConfig::project_root(&config)?)?;
+        ProjectIdentity::resolve(&cfg.project.name, &SchemaConfig::project_root(config)?)?;
 
     let stdout = io::stdout();
     let mut out = stdout.lock();

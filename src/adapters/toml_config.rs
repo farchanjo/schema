@@ -4,10 +4,13 @@
 //! or removing fields is a breaking change for them; do it by bumping
 //! `[project] version` and shipping a migration note in CLAUDE.md.
 
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+
+use crate::domain::CorpusKind;
 
 /// Top-level structure of `schema.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,17 +60,6 @@ pub struct Corpus {
     pub exclude: Vec<String>,
 }
 
-/// FASE 1.0 supports five kinds. `code` (rs/py/ts via tree-sitter) is FASE 2.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CorpusKind {
-    AdrMadr,
-    Markdown,
-    Glossary,
-    Cue,
-    Openapi,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingConfig {
     /// Embedding model identifier. FASE 1.0 only supports `"bge-m3"`.
@@ -102,13 +94,13 @@ pub struct RetrievalConfig {
     pub file_size_max: u64,
 }
 
-fn default_top_k() -> usize {
+const fn default_top_k() -> usize {
     8
 }
-fn default_chunk_size_max() -> usize {
+const fn default_chunk_size_max() -> usize {
     8_192
 }
-fn default_file_size_max() -> u64 {
+const fn default_file_size_max() -> u64 {
     5_242_880 // 5 MiB
 }
 
@@ -157,16 +149,22 @@ impl Default for SecurityConfig {
 
 impl SchemaConfig {
     /// Read `schema.toml` from a path and validate it.
+    ///
+    /// # Errors
+    /// Returns an error if the file cannot be read, parsed as TOML, or fails
+    /// semantic validation (empty name, path traversal, unsupported model).
     pub fn load(path: &Path) -> Result<Self> {
-        let raw = std::fs::read_to_string(path)
+        let raw = fs::read_to_string(path)
             .with_context(|| format!("reading schema.toml at {}", path.display()))?;
-        let cfg: SchemaConfig =
-            toml::from_str(&raw).with_context(|| "parsing schema.toml as TOML")?;
+        let cfg: Self = toml::from_str(&raw).with_context(|| "parsing schema.toml as TOML")?;
         cfg.validate(path)?;
         Ok(cfg)
     }
 
     /// Resolve the project root directory — the directory containing `schema.toml`.
+    ///
+    /// # Errors
+    /// Returns an error if `config_path` cannot be canonicalised or has no parent.
     pub fn project_root(config_path: &Path) -> Result<PathBuf> {
         let canonical = config_path
             .canonicalize()
@@ -183,47 +181,48 @@ impl SchemaConfig {
         if self.project.name.is_empty() {
             bail!("[project] name must not be empty");
         }
-
-        let root = SchemaConfig::project_root(config_path)?;
+        let root = Self::project_root(config_path)?;
         for (idx, corpus) in self.corpus.iter().enumerate() {
-            // Refuse absolute paths or path traversal.
-            if corpus.path.is_absolute() {
-                bail!(
-                    "corpus[{idx}].path must be relative to project root (got absolute: {})",
-                    corpus.path.display()
-                );
-            }
-            if corpus
-                .path
-                .components()
-                .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                bail!(
-                    "corpus[{idx}].path must not contain '..' (got {})",
-                    corpus.path.display()
-                );
-            }
-            // Sanity check: path resolves within root.
-            let resolved = root.join(&corpus.path);
-            if let Ok(canon) = resolved.canonicalize()
-                && !canon.starts_with(&root)
-            {
-                bail!(
-                    "corpus[{idx}].path escapes project root (resolves to {})",
-                    canon.display()
-                );
-            }
+            validate_corpus_path(idx, corpus, &root)?;
         }
-
         if self.embedding.model != "bge-m3" {
             bail!(
                 "[embedding] model = {:?} is not supported in FASE 1.0 (only \"bge-m3\")",
                 self.embedding.model
             );
         }
-
         Ok(())
     }
+}
+
+/// Reject absolute paths, parent-dir traversal, and resolved paths outside `root`.
+fn validate_corpus_path(idx: usize, corpus: &Corpus, root: &Path) -> Result<()> {
+    if corpus.path.is_absolute() {
+        bail!(
+            "corpus[{idx}].path must be relative to project root (got absolute: {})",
+            corpus.path.display()
+        );
+    }
+    if corpus
+        .path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        bail!(
+            "corpus[{idx}].path must not contain '..' (got {})",
+            corpus.path.display()
+        );
+    }
+    let resolved = root.join(&corpus.path);
+    if let Ok(canon) = resolved.canonicalize()
+        && !canon.starts_with(root)
+    {
+        bail!(
+            "corpus[{idx}].path escapes project root (resolves to {})",
+            canon.display()
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

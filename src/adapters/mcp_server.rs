@@ -1,33 +1,37 @@
-//! `SchemaServer` — root rmcp server struct.
+//! `SchemaServer` — driving adapter that exposes [`crate::app`] services
+//! over the MCP protocol via rmcp + stdio.
 //!
 //! Tools are registered via the `#[tool_router]` macro attribute. Each tool is
 //! an `async fn` (or sync `fn`) on the server impl block decorated with
-//! `#[tool(description = "...")]`. Mutable state (the embedder requires `&mut`
-//! to embed) lives behind `Arc<...>` (immutable sharing) and `tokio::sync::Mutex`
-//! (async-safe interior mutability) so the server type stays `Clone` — rmcp
-//! clones it per in-flight request.
+//! `#[tool(description = "...")]`.
 //!
 //! FASE 1.0 exposes:
 //!   - `ping`             smoke test
 //!   - `query`            generic top-K RAG
-//!   - `find_decisions`   query restricted to kind = adr-madr (commit 8)
-//!   - `glossary_lookup`  query restricted to kind = glossary (commit 8)
-//!   - `cross_reference`  artifact_id → referencing chunks (commit 9)
-//!   - `list_corpus`      debug listing (commit 8)
+//!   - `find_decisions`   query restricted to kind = adr-madr
+//!   - `glossary_lookup`  query restricted to kind = glossary
+//!   - `cross_reference`  `artifact_id` → referencing chunks
+//!   - `list_corpus`      debug listing
 
 use std::sync::Arc;
 
+use anyhow::Result;
+use rmcp::transport::stdio;
 use rmcp::{ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 use tracing::info;
 
-use crate::config::{ProjectIdentity, SchemaConfig};
-use crate::embeddings::Embedder;
-use crate::retrieval::{ChunkRecord, VectorStore};
+use crate::adapters::project_identity::ProjectIdentity;
+use crate::adapters::toml_config::SchemaConfig;
+use crate::app::query::Query;
+use crate::domain::ChunkRecord;
 
 /// Empty parameter set — `ping` takes no arguments.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "schemars/serde derive shapes JSON `{}`, not `null`; converting to a unit struct would change MCP request schema"
+)]
 pub struct PingParams {}
 
 /// Arguments for the generic `query` tool.
@@ -67,6 +71,10 @@ pub struct GlossaryLookupParams {
 
 /// Empty parameter set — `list_corpus` takes no arguments.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "schemars/serde derive shapes JSON `{}`, not `null`; converting to a unit struct would change MCP request schema"
+)]
 pub struct ListCorpusParams {}
 
 /// Result of `list_corpus`.
@@ -135,17 +143,14 @@ impl From<ChunkRecord> for ToolChunk {
 
 /// Server-side state shared by all tool handlers.
 ///
-/// `store` and `embedder` are `Arc<...>` because the watcher consumer task
-/// (spawned in `main::run_serve`) needs read+write access in parallel with
-/// MCP tool handlers. Cloning the Arc is cheap; both layers see the same
-/// instances. The Mutex around `Embedder` serialises concurrent embed
-/// calls (fastembed's API requires `&mut self`).
+/// Holds the read-side [`Query`] service plus project metadata. Mutating
+/// services (the [`crate::app::delta_sync::DeltaSync`]) belong to the watcher
+/// task spawned in `main`; the MCP layer itself is read-only.
 #[derive(Debug)]
 pub struct ServerState {
     pub config: SchemaConfig,
     pub identity: ProjectIdentity,
-    pub store: Arc<VectorStore>,
-    pub embedder: Arc<Mutex<Embedder>>,
+    pub query: Query,
 }
 
 /// The MCP server instance.
@@ -160,6 +165,14 @@ pub struct SchemaServer {
 impl SchemaServer {
     /// Smoke-test tool. Returns the literal string `"pong"`.
     #[tool(description = "Health probe for the schema MCP server. Returns \"pong\".")]
+    #[expect(
+        clippy::same_name_method,
+        reason = "rmcp tool_router macro generates an inner method with the same name as the user-declared tool fn"
+    )]
+    #[expect(
+        clippy::unused_self,
+        reason = "rmcp #[tool] handlers must be methods on the server type; making this an associated fn would break tool registration"
+    )]
     fn ping(&self, _params: Parameters<PingParams>) -> String {
         info!("ping tool invoked");
         "pong".to_string()
@@ -171,8 +184,14 @@ impl SchemaServer {
         description = "Generic top-K semantic search over the project's indexed corpus. Returns the closest chunks (with source path + line range) for a natural-language query."
     )]
     async fn query(&self, Parameters(params): Parameters<QueryParams>) -> String {
-        match self.run_query(&params.query, params.top_k, None).await {
-            Ok(chunks) => json_or_error(&chunks),
+        let top_k = params
+            .top_k
+            .unwrap_or(self.state.config.retrieval.top_k_default);
+        match self.state.query.run(&params.query, top_k, None).await {
+            Ok(records) => {
+                let chunks: Vec<ToolChunk> = records.into_iter().map(ToolChunk::from).collect();
+                json_or_error(&chunks)
+            }
             Err(e) => format_error(&format!("{e}")),
         }
     }
@@ -182,11 +201,19 @@ impl SchemaServer {
         description = "Top-K semantic search restricted to architectural decisions (ADRs). Use when you specifically want decisions and their rationale, not general docs."
     )]
     async fn find_decisions(&self, Parameters(params): Parameters<FindDecisionsParams>) -> String {
+        let top_k = params
+            .top_k
+            .unwrap_or(self.state.config.retrieval.top_k_default);
         match self
-            .run_query(&params.query, params.top_k, Some("AdrMadr"))
+            .state
+            .query
+            .run(&params.query, top_k, Some("AdrMadr"))
             .await
         {
-            Ok(chunks) => json_or_error(&chunks),
+            Ok(records) => {
+                let chunks: Vec<ToolChunk> = records.into_iter().map(ToolChunk::from).collect();
+                json_or_error(&chunks)
+            }
             Err(e) => format_error(&format!("{e}")),
         }
     }
@@ -199,11 +226,19 @@ impl SchemaServer {
         &self,
         Parameters(params): Parameters<GlossaryLookupParams>,
     ) -> String {
+        let top_k = params
+            .top_k
+            .unwrap_or(self.state.config.retrieval.top_k_default);
         match self
-            .run_query(&params.term, params.top_k, Some("Glossary"))
+            .state
+            .query
+            .run(&params.term, top_k, Some("Glossary"))
             .await
         {
-            Ok(chunks) => json_or_error(&chunks),
+            Ok(records) => {
+                let chunks: Vec<ToolChunk> = records.into_iter().map(ToolChunk::from).collect();
+                json_or_error(&chunks)
+            }
             Err(e) => format_error(&format!("{e}")),
         }
     }
@@ -219,23 +254,22 @@ impl SchemaServer {
         let def_limit = params.definition_limit.unwrap_or(16);
         let ref_limit = params.reference_limit.unwrap_or(32);
 
-        let store = &self.state.store;
-        let definition = match store
-            .find_by_artifact_id(&params.artifact_id, def_limit)
+        match self
+            .state
+            .query
+            .cross_reference(&params.artifact_id, def_limit, ref_limit)
             .await
         {
-            Ok(records) => records.into_iter().map(ToolChunk::from).collect(),
-            Err(e) => return format_error(&format!("definition lookup failed: {e}")),
-        };
-        let references = match store.find_mentioning(&params.artifact_id, ref_limit).await {
-            Ok(records) => records.into_iter().map(ToolChunk::from).collect(),
-            Err(e) => return format_error(&format!("references lookup failed: {e}")),
-        };
-
-        json_or_error(&CrossReferenceResult {
-            definition,
-            references,
-        })
+            Ok(xref) => {
+                let definition = xref.definition.into_iter().map(ToolChunk::from).collect();
+                let references = xref.references.into_iter().map(ToolChunk::from).collect();
+                json_or_error(&CrossReferenceResult {
+                    definition,
+                    references,
+                })
+            }
+            Err(e) => format_error(&format!("{e}")),
+        }
     }
 
     /// Debug — list every distinct source path indexed for this project.
@@ -243,7 +277,7 @@ impl SchemaServer {
         description = "List every source file currently in the project's index. Useful for verifying what schema sees vs what the project ships."
     )]
     async fn list_corpus(&self, _params: Parameters<ListCorpusParams>) -> String {
-        match self.state.store.list_source_paths().await {
+        match self.state.query.list_source_paths().await {
             Ok(paths) => {
                 let listing = CorpusListing {
                     project: self.state.config.project.name.clone(),
@@ -272,6 +306,7 @@ fn format_error(message: &str) -> String {
 
 impl SchemaServer {
     /// Construct a server with fully-resolved state.
+    #[must_use]
     pub fn with_state(state: ServerState) -> Self {
         Self {
             state: Arc::new(state),
@@ -279,33 +314,15 @@ impl SchemaServer {
     }
 
     /// Run the MCP server over stdio until the client disconnects.
-    pub async fn run_stdio(self) -> anyhow::Result<()> {
+    ///
+    /// # Errors
+    /// Returns an error if rmcp fails to bind the stdio transport or the
+    /// service exits abnormally.
+    pub async fn run_stdio(self) -> Result<()> {
         info!("starting schema MCP server (stdio transport)");
-        let service = self.serve(rmcp::transport::stdio()).await?;
+        let service = self.serve(stdio()).await?;
         service.waiting().await?;
         info!("schema MCP server shut down cleanly");
         Ok(())
-    }
-
-    async fn run_query(
-        &self,
-        query_text: &str,
-        top_k_override: Option<usize>,
-        kind_filter: Option<&str>,
-    ) -> anyhow::Result<Vec<ToolChunk>> {
-        let top_k = top_k_override.unwrap_or(self.state.config.retrieval.top_k_default);
-        let vector = {
-            let mut emb = self.state.embedder.lock().await;
-            let mut vectors = emb.embed(vec![query_text], None)?;
-            vectors
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("embedder returned no vectors"))?
-        };
-        let records = self
-            .state
-            .store
-            .query_nearest(&vector, top_k, kind_filter)
-            .await?;
-        Ok(records.into_iter().map(ToolChunk::from).collect())
     }
 }

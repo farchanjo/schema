@@ -5,6 +5,8 @@
 //! path*. Renaming or moving the project produces a fresh cache directory; two
 //! projects with the same name in different paths never collide.
 
+use std::fmt;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -19,6 +21,7 @@ pub struct ProjectId(String);
 
 impl ProjectId {
     /// Compute the project ID from a project name and its canonical absolute path.
+    #[must_use]
     pub fn new(name: &str, canonical_path: &Path) -> Self {
         let hash = blake3::hash(canonical_path.as_os_str().as_encoded_bytes());
         let prefix: String = hash
@@ -30,13 +33,14 @@ impl ProjectId {
         Self(format!("{sanitised}-{prefix}"))
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 }
 
-impl std::fmt::Display for ProjectId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for ProjectId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
@@ -47,13 +51,19 @@ pub struct ProjectIdentity {
     pub id: ProjectId,
     pub root: PathBuf,
     pub cache_dir: PathBuf,
-    pub lance_dir: PathBuf,
+    /// Path to the `SQLite` database file backing the `sqlite-vec` store
+    /// (ADR-0011). Was `lance_dir` (a directory) before; now a single file.
+    pub store_path: PathBuf,
     pub metadata_path: PathBuf,
     pub lock_path: PathBuf,
 }
 
 impl ProjectIdentity {
     /// Resolve identity for a project rooted at `project_root` with the given name.
+    ///
+    /// # Errors
+    /// Returns an error if `project_root` cannot be canonicalised or the user
+    /// cache directory cannot be resolved.
     pub fn resolve(name: &str, project_root: &Path) -> Result<Self> {
         let canonical_root = project_root
             .canonicalize()
@@ -61,7 +71,7 @@ impl ProjectIdentity {
         let id = ProjectId::new(name, &canonical_root);
         let cache_root = cache_root()?;
         let cache_dir = cache_root.join("projects").join(id.as_str());
-        let lance_dir = cache_dir.join("lance");
+        let store_path = cache_dir.join("store.db");
         let metadata_path = cache_dir.join("metadata.toml");
         let lock_path = cache_dir.join("lock");
 
@@ -69,21 +79,27 @@ impl ProjectIdentity {
             id,
             root: canonical_root,
             cache_dir,
-            lance_dir,
+            store_path,
             metadata_path,
             lock_path,
         })
     }
 
     /// Ensure the cache directory exists on disk. Idempotent.
+    ///
+    /// # Errors
+    /// Returns an error if the directory cannot be created (permissions, etc.).
     pub fn ensure_cache_dir(&self) -> Result<()> {
-        std::fs::create_dir_all(&self.cache_dir)
+        fs::create_dir_all(&self.cache_dir)
             .with_context(|| format!("creating cache dir {}", self.cache_dir.display()))?;
         Ok(())
     }
 }
 
 /// Resolve `~/.cache/schema/` (or platform equivalent via `dirs::cache_dir`).
+///
+/// # Errors
+/// Returns an error if the user cache directory cannot be determined (e.g. `HOME` unset).
 pub fn cache_root() -> Result<PathBuf> {
     let base = dirs::cache_dir()
         .ok_or_else(|| anyhow::anyhow!("could not resolve user cache dir (HOME unset?)"))?;
