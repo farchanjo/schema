@@ -1,11 +1,22 @@
 ---
-status: accepted
+status: superseded by ADR-0011
 date: 2026-04-25
 decision-makers: ["Fabricio Archanjo"]
 review-due: 2027-04-25
+superseded-by: ["ADR-0011"]
 ---
 
 # 0006 — LanceDB embedded vector store
+
+> **Superseded by [ADR-0011](./0011-sqlite-vec-store.md).** Within hours
+> of accepting this ADR, a re-evaluation against the actual upper bound
+> of corpus size (≤ 50 K chunks per project) concluded that LanceDB's
+> ANN, Arrow lineage, and MVCC are answers to problems we do not have
+> at this scale, and that **SQLite + `sqlite-vec` + FTS5 + WAL** covers
+> the same three roadmap drivers (hybrid search, Parquet export,
+> concurrent readers) at a fraction of the dependency and compile-time
+> cost. The decision body below is preserved for historical context;
+> the active store choice is recorded in ADR-0011.
 
 > **Y-statement** — In the context of persisting chunks + their bge-m3
 > embeddings (ADR-0005, 1024-dim Float32) plus structured metadata
@@ -170,3 +181,14 @@ fd-lock advisory lock on the project's cache dir (FASE 1.1), two
   store indexes).
 - ADR-0007 — delta-sync protocol on top of this store.
 - ADR-0008 — cache isolation (lance dir per project).
+- ADR-0011 — supersedes this decision; switches the store to SQLite +
+  `sqlite-vec` + FTS5 + WAL.
+
+## Evidence and amendments
+
+- _2026-04-25 — Superseded by ADR-0011. Same-day reconsideration: the
+  three drivers cited here (hybrid search, Arrow/Parquet lineage, MVCC
+  for two readers) are all served by SQLite + `sqlite-vec` + FTS5 + WAL
+  at lower compile-time and dependency cost, and the ANN value
+  proposition does not apply at the project's actual upper bound of
+  ~50 K chunks per consumer. See ADR-0011 for the full re-analysis._

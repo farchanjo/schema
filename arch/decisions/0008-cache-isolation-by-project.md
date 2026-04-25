@@ -165,8 +165,33 @@ future `schema gc --orphans` (FASE 1.1) cleans them up.
 
 ## More information
 
-- `src/config/project.rs` — `ProjectId`, `ProjectIdentity`.
+- `src/adapters/project_identity.rs` — `ProjectId`, `ProjectIdentity`
+  (was `src/config/project.rs` before ADR-0013 hex restructure).
 - ADR-0003 — multi-project architecture (the why).
 - ADR-0005 — model cache lives outside per-project state.
-- ADR-0006 — LanceDB store shape.
+- ADR-0006 — LanceDB store shape (superseded by ADR-0011).
 - ADR-0007 — manifest lives in the same per-project dir.
+- ADR-0011 — replaces LanceDB with SQLite + `sqlite-vec`;
+  cache layout updated (see Evidence amendment 2026-04-25).
+- ADR-0013 — hexagonal restructure moved `ProjectIdentity`
+  from `src/config/` into `src/adapters/`.
+
+## Evidence and amendments
+
+- _2026-04-25 — Cache layout amended by ADR-0011 implementation.
+  The per-project store changed from a directory `lance/`
+  (LanceDB) to a single file `store.db` (SQLite +
+  `sqlite-vec`), with WAL companions `store.db-wal` and
+  `store.db-shm`. The diagram in **Resulting structure**
+  remains correct in shape (per-project cache directory under
+  `~/.cache/schema/projects/<id>/`); only the inner artifact
+  changed from a directory to a file. Cleanup, copy, and
+  inspection are now filesystem operations on a single file.
+  Legacy `lance/` directories from prior versions are detected
+  and reported via `tracing::warn!` on first `schema serve`
+  (ADR-0011 Follow-ups: manual migration policy). The
+  `ProjectIdentity` field was renamed `lance_dir` → `store_path`._
+- _2026-04-25 — Source location moved by ADR-0013. The struct
+  now lives at `src/adapters/project_identity.rs` (was
+  `src/config/project.rs`); the cache-path resolution is an
+  adapter concern under the new hex layout._
