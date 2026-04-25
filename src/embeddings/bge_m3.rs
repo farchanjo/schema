@@ -36,6 +36,14 @@ pub struct Embedder {
     model: TextEmbedding,
 }
 
+impl std::fmt::Debug for Embedder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Embedder")
+            .field("model", &"<fastembed::TextEmbedding bge-m3>")
+            .finish()
+    }
+}
+
 impl Embedder {
     /// Initialise the BGE-M3 embedder. Caches the model under
     /// `~/.cache/schema/models/`.
@@ -86,6 +94,10 @@ fn bge_m3_cache_dir() -> Result<PathBuf, EmbedderError> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test fixtures may panic if the env is broken"
+    )]
     use super::*;
 
     #[test]

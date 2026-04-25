@@ -4,6 +4,14 @@
 //! starting the MCP server over stdio. `validate` checks `schema.toml` without
 //! starting the server (FASE 1.0 stub).
 
+#![allow(
+    unused_crate_dependencies,
+    reason = "binary target sees lib-only deps as unused; \
+              `unused_crate_dependencies` is per-target. The lib's own \
+              attribute covers the library; this allows the binary."
+)]
+
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -62,12 +70,16 @@ fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_writer(std::io::stderr))
+        .with(fmt::layer().with_writer(io::stderr))
         .init();
 }
 
 async fn run_serve(config: PathBuf) -> Result<()> {
     use schema::config::{ProjectIdentity, SchemaConfig};
+    use schema::embeddings::Embedder;
+    use schema::mcp::ServerState;
+    use schema::retrieval::{DeltaSync, VectorStore};
+    use tokio::sync::Mutex;
 
     let cfg = SchemaConfig::load(&config)?;
     let identity =
@@ -79,9 +91,27 @@ async fn run_serve(config: PathBuf) -> Result<()> {
         "schema config loaded; cache resolved",
     );
 
-    // Subsequent commits wire corpus/embeddings/retrieval/tools onto this server.
-    let server = SchemaServer::new();
-    server.run_stdio().await
+    // Initialise vector store + embedder.
+    let store = VectorStore::open(&identity.lance_dir).await?;
+    store.ensure_table().await?;
+    let mut embedder = Embedder::new_bge_m3()?;
+
+    // Delta-sync the corpus before serving requests (per ADR-0007).
+    let sync = DeltaSync {
+        config: &cfg,
+        project_root: &identity.root,
+        metadata_path: &identity.metadata_path,
+    };
+    let report = sync.run(&store, &mut embedder).await?;
+    tracing::info!(?report, "initial delta-sync complete");
+
+    let state = ServerState {
+        config: cfg,
+        identity,
+        store,
+        embedder: Mutex::new(embedder),
+    };
+    SchemaServer::with_state(state).run_stdio().await
 }
 
 fn run_validate(config: PathBuf) -> Result<()> {
@@ -90,14 +120,17 @@ fn run_validate(config: PathBuf) -> Result<()> {
     let cfg = SchemaConfig::load(&config)?;
     let identity =
         ProjectIdentity::resolve(&cfg.project.name, &SchemaConfig::project_root(&config)?)?;
-    println!("schema.toml is valid.");
-    println!("  project name : {}", cfg.project.name);
-    println!("  project id   : {}", identity.id);
-    println!("  project root : {}", identity.root.display());
-    println!("  cache dir    : {}", identity.cache_dir.display());
-    println!("  corpus       : {} entries", cfg.corpus.len());
+
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "schema.toml is valid.")?;
+    writeln!(out, "  project name : {}", cfg.project.name)?;
+    writeln!(out, "  project id   : {}", identity.id)?;
+    writeln!(out, "  project root : {}", identity.root.display())?;
+    writeln!(out, "  cache dir    : {}", identity.cache_dir.display())?;
+    writeln!(out, "  corpus       : {} entries", cfg.corpus.len())?;
     for c in &cfg.corpus {
-        println!("    - {} ({:?})", c.path.display(), c.kind);
+        writeln!(out, "    - {} ({:?})", c.path.display(), c.kind)?;
     }
     Ok(())
 }

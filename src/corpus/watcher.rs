@@ -23,9 +23,21 @@ pub enum CorpusEvent {
 /// Wraps a `notify` watcher and forwards events to a Tokio mpsc receiver.
 pub struct CorpusWatcher {
     /// Owns the underlying notify watcher; dropping this stops the watch.
-    #[allow(dead_code)]
+    #[expect(
+        dead_code,
+        reason = "field is held to keep the watcher alive for the lifetime of the struct"
+    )]
     inner: Box<dyn Watcher + Send>,
     pub events: Receiver<CorpusEvent>,
+}
+
+impl std::fmt::Debug for CorpusWatcher {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CorpusWatcher")
+            .field("inner", &"<dyn Watcher>")
+            .field("events", &"<mpsc::Receiver<CorpusEvent>>")
+            .finish()
+    }
 }
 
 impl CorpusWatcher {

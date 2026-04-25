@@ -57,6 +57,14 @@ pub struct VectorStore {
     conn: Connection,
 }
 
+impl std::fmt::Debug for VectorStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VectorStore")
+            .field("conn", &"<lancedb::Connection>")
+            .finish()
+    }
+}
+
 impl VectorStore {
     /// Open (or create) the LanceDB at the given path.
     pub async fn open(lance_dir: &Path) -> Result<Self, VectorStoreError> {

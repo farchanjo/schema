@@ -31,13 +31,14 @@ pub struct SyncReport {
     pub chunks_indexed: usize,
 }
 
+#[derive(Debug)]
 pub struct DeltaSync<'a> {
     pub config: &'a SchemaConfig,
     pub project_root: &'a std::path::Path,
     pub metadata_path: &'a std::path::Path,
 }
 
-impl<'a> DeltaSync<'a> {
+impl DeltaSync<'_> {
     pub async fn run(
         &self,
         store: &VectorStore,

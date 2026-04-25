@@ -83,3 +83,53 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# ─── Strict lint baseline (Layer A + Layer C only — Layer B deferred) ──
+# Layer A: safety + output-critical clippy lints.
+# All at `deny` rather than `forbid` because:
+#   1. derive macros (e.g., `#[derive(clap::Parser)]`) inject internal
+#      `allow(clippy::restriction)` attributes. With Layer A at `forbid`
+#      the compiler refuses these allows (E0453); macro-driven code
+#      stops compiling.
+#   2. test code legitimately uses `unwrap()` for fixture setup; narrow
+#      `#[allow(..., reason = "...")]` per-module is the canonical
+#      escape, which `forbid` blocks.
+# `deny` still blocks regressions in CI (`-D warnings` makes them
+# errors) while letting `#[allow]` rescue legitimate exceptions.
+[lints.clippy]
+unwrap_used   = "deny"
+expect_used   = "deny"
+panic         = "deny"
+todo          = "deny"
+unimplemented = "deny"
+dbg_macro     = "deny"
+exit          = "deny"
+mem_forget    = "deny"
+infinite_loop = "deny"
+print_stdout  = "deny"
+print_stderr  = "deny"
+
+# Layer C: rustc anti-dead-code + anti-cruft lints. unsafe_code is
+# `forbid` because schema has no need for unsafe blocks; if FASE 2 ever
+# requires `unsafe`, downgrade to `deny` deliberately via an ADR.
+[lints.rust]
+unsafe_code                   = "forbid"
+dead_code                     = "deny"
+unused_imports                = "deny"
+unused_variables              = "deny"
+unused_mut                    = "deny"
+unused_must_use               = "deny"
+unused_assignments            = "deny"
+unreachable_code              = "deny"
+unreachable_patterns          = "deny"
+unused_crate_dependencies     = "deny"
+unused_lifetimes              = "deny"
+unused_qualifications         = "deny"
+single_use_lifetimes          = "warn"
+trivial_numeric_casts         = "deny"
+trivial_casts                 = "deny"
+let_underscore_drop           = "deny"
+missing_debug_implementations = "warn"
+future_incompatible           = { level = "deny", priority = -1 }
+rust_2018_idioms              = { level = "deny", priority = -1 }
+rust_2024_compatibility       = { level = "warn", priority = -1 }

@@ -2,4 +2,4 @@
 
 pub mod server;
 
-pub use server::SchemaServer;
+pub use server::{SchemaServer, ServerState};

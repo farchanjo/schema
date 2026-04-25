@@ -34,6 +34,7 @@ pub struct DiscoveredFile {
 }
 
 /// Walks every corpus entry in a [`SchemaConfig`] under a given project root.
+#[derive(Debug)]
 pub struct Walker<'a> {
     config: &'a SchemaConfig,
     project_root: &'a Path,
@@ -158,6 +159,10 @@ impl<'a> Walker<'a> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test fixtures may panic if the env is broken"
+    )]
     use super::*;
     use std::fs;
     use tempfile::TempDir;

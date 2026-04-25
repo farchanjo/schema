@@ -44,6 +44,7 @@ pub struct Chunk {
     pub kind: CorpusKind,
 }
 
+#[derive(Debug)]
 pub struct Chunker {
     chunk_size_max: usize,
 }
@@ -204,7 +205,7 @@ impl Chunker {
 
     /// If the candidate fits within `chunk_size_max`, push it as one chunk;
     /// otherwise split on paragraph boundaries until each piece fits.
-    fn push_chunk_or_split(&self, chunks: &mut Vec<Chunk>, args: ChunkArgs) {
+    fn push_chunk_or_split(&self, chunks: &mut Vec<Chunk>, args: ChunkArgs<'_>) {
         let ChunkArgs {
             source_path,
             line_start,
@@ -314,6 +315,10 @@ fn extract_adr_id(text: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test fixtures may panic if the env is broken"
+    )]
     use super::*;
 
     #[test]

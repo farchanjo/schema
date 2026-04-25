@@ -228,6 +228,10 @@ impl SchemaConfig {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test fixtures may panic if the env is broken"
+    )]
     use super::*;
 
     #[test]

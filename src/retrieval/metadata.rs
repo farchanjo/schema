@@ -103,6 +103,10 @@ pub fn file_mtime(path: &Path) -> std::io::Result<i64> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test fixtures may panic if the env is broken"
+    )]
     use super::*;
     use tempfile::TempDir;
 

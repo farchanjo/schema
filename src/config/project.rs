@@ -116,6 +116,10 @@ fn sanitise(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test fixtures may panic if the env is broken"
+    )]
     use super::*;
 
     #[test]
@@ -128,7 +132,7 @@ mod tests {
 
     #[test]
     fn project_id_is_deterministic() {
-        let path = std::path::PathBuf::from("/tmp/foo");
+        let path = PathBuf::from("/tmp/foo");
         let a = ProjectId::new("demo", &path);
         let b = ProjectId::new("demo", &path);
         assert_eq!(a, b);
