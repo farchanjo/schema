@@ -66,14 +66,38 @@ fn init_tracing() {
         .init();
 }
 
-async fn run_serve(_config: PathBuf) -> Result<()> {
-    // FASE 1.0: ignore config; subsequent commit wires the loader.
+async fn run_serve(config: PathBuf) -> Result<()> {
+    use schema::config::{ProjectIdentity, SchemaConfig};
+
+    let cfg = SchemaConfig::load(&config)?;
+    let identity =
+        ProjectIdentity::resolve(&cfg.project.name, &SchemaConfig::project_root(&config)?)?;
+    identity.ensure_cache_dir()?;
+    tracing::info!(
+        project = %identity.id,
+        cache_dir = %identity.cache_dir.display(),
+        "schema config loaded; cache resolved",
+    );
+
+    // Subsequent commits wire corpus/embeddings/retrieval/tools onto this server.
     let server = SchemaServer::new();
     server.run_stdio().await
 }
 
-fn run_validate(_config: PathBuf) -> Result<()> {
-    // FASE 1.0 stub. Real validation lands with the config loader commit.
-    println!("schema.toml validation: not yet implemented (FASE 1.0 stub)");
+fn run_validate(config: PathBuf) -> Result<()> {
+    use schema::config::{ProjectIdentity, SchemaConfig};
+
+    let cfg = SchemaConfig::load(&config)?;
+    let identity =
+        ProjectIdentity::resolve(&cfg.project.name, &SchemaConfig::project_root(&config)?)?;
+    println!("schema.toml is valid.");
+    println!("  project name : {}", cfg.project.name);
+    println!("  project id   : {}", identity.id);
+    println!("  project root : {}", identity.root.display());
+    println!("  cache dir    : {}", identity.cache_dir.display());
+    println!("  corpus       : {} entries", cfg.corpus.len());
+    for c in &cfg.corpus {
+        println!("    - {} ({:?})", c.path.display(), c.kind);
+    }
     Ok(())
 }

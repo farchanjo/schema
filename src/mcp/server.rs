@@ -7,10 +7,7 @@
 //! JSON-RPC pipeline is alive. Subsequent commits add: `query`, `find_decisions`,
 //! `glossary_lookup`, `cross_reference`, `list_corpus`.
 
-use rmcp::{
-    handler::server::wrapper::Parameters,
-    schemars, tool, tool_router, ServiceExt,
-};
+use rmcp::{ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router};
 use serde::Deserialize;
 use tracing::info;
 
