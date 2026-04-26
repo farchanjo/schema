@@ -2,16 +2,44 @@
 
 Operating handbook for `schema`: install, configure, debug, recover.
 
-## Install
+## Install (macOS, per ADR-0014)
 
 ```bash
 git clone <repo> ~/dev/mcp-schema
 cd ~/dev/mcp-schema
 mise install                     # installs Rust 1.95.0 per .mise.toml
 mise trust                       # if not already trusted
-cargo install --path .           # builds release, installs `schema` to ~/.cargo/bin/
-schema --version                 # verify
+
+# Build + sign + install per ADR-0014:
+cargo build --release
+codesign --sign "Apple Development: Fabricio Fonseca (J3LVNXCU3U)" \
+         --options runtime \
+         --force \
+         target/release/schema
+sudo install -m 0755 target/release/schema /usr/local/bin/schema
+codesign --verify --verbose=2 /usr/local/bin/schema   # fitness check
+schema --version                                       # smoke
 ```
+
+**Why `/usr/local/bin/` + Apple codesign and not `cargo install`:**
+guarantees `PATH` resolution under every Claude Code spawn context
+(the consumer's `.mcp.json` says `"command": "schema"`) and produces
+a Gatekeeper-friendly signature that survives moving the binary
+between Macs. Full rationale in ADR-0014.
+
+If a stale `~/.cargo/bin/schema` exists from prior `cargo install`
+runs, remove it once: `rm ~/.cargo/bin/schema`.
+
+## Install (Linux)
+
+```bash
+cargo build --release
+sudo install -m 0755 target/release/schema /usr/local/bin/schema
+schema --version
+```
+
+Codesign is a macOS concept and skipped here. ADR-0014 scopes only
+macOS.
 
 ## Configure a consumer project
 
@@ -166,9 +194,30 @@ echo "ulimit -n 4096" >> ~/.zshrc
 
 ### Force re-index
 
+Preferred (ADR-0015) — keeps the project cache directory and only
+empties the store + manifest:
+
+```bash
+schema reset --config schema.toml --yes
+# next `schema serve` rebuilds from scratch (~30-60 s)
+```
+
+Or, mid-session, the LLM can call the MCP tool `reset_index` (the
+description is prefixed `DESTRUCTIVE` so a well-behaved client
+asks the operator first).
+
+To drop a single source path without wiping the whole index:
+
+```bash
+schema forget --config schema.toml --path docs/decisions/0042.md
+```
+
+The matching MCP tool is `forget_source` (also `DESTRUCTIVE`).
+
+Fallback (still works if the cache itself is corrupt):
+
 ```bash
 rm -rf ~/.cache/schema/projects/<project-name>-<hash>/
-# next `schema serve` will rebuild from scratch (~30-60 s)
 ```
 
 A `schema reindex --full` command is planned for FASE 1.1.
@@ -206,6 +255,8 @@ rm -rf ~/.cache/schema/models/
 | `glossary_lookup`   | Term → definition (semantic match).                      |
 | `cross_reference`   | Artifact id → defining + referencing chunks.             |
 | `list_corpus`       | Debug — list every indexed source path.                  |
+| `reset_index`       | DESTRUCTIVE — wipe the whole index + manifest (ADR-0015).|
+| `forget_source`     | DESTRUCTIVE — drop one source path from index + manifest (ADR-0015). |
 
 Discoverable via Claude Code's `/mcp` listing once schema is
 running.

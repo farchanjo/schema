@@ -124,8 +124,49 @@ cargo test                      # all tests
 cargo fmt --all                 # format
 cargo fmt --all -- --check      # CI-style format check
 cargo clippy --all-targets --all-features -- -D warnings   # lint, warn = error
-cargo install --path .          # install schema to PATH
+```
 
+## Install + codesign on macOS (ADR-0014)
+
+The `schema` binary is **installed at `/usr/local/bin/schema`** and
+**codesigned with the operator's Apple Development identity**. This is
+not the Cargo default (`~/.cargo/bin/`) — it is the project's deliberate
+choice per ADR-0014 to guarantee `PATH` resolution from any Claude Code
+spawn context and to produce a Gatekeeper-friendly signature that
+survives moving the binary between Macs.
+
+**Canonical install / upgrade procedure** (run from the repo root):
+
+```bash
+cargo build --release
+codesign --sign "Apple Development: Fabricio Fonseca (J3LVNXCU3U)" \
+         --options runtime \
+         --force \
+         target/release/schema
+sudo install -m 0755 target/release/schema /usr/local/bin/schema
+codesign --verify --verbose=2 /usr/local/bin/schema
+schema --version
+```
+
+- `--options runtime` enables the **Hardened Runtime**.
+- `sudo install` is atomic (replaces the file in one step; running
+  Claude Code sessions continue using the old binary in memory until
+  they restart).
+- The verify step is the **fitness function** of ADR-0014; it must
+  exit 0 and show the developer's identity in the Authority chain.
+
+**Do not** use `cargo install --path .` for this project — it lands in
+`~/.cargo/bin/` (ad-hoc-signed only, `PATH` order ambiguity, no
+Gatekeeper headers). If a stale `~/.cargo/bin/schema` exists from a
+previous run, `rm` it once after the first `/usr/local/bin` install to
+keep `which -a schema` unambiguous.
+
+Cross-platform note: ADR-0014 covers macOS only. On Linux follow the
+distro convention (`/usr/local/bin` is fine; codesign is a no-op).
+A fresh ADR is required before introducing Homebrew distribution,
+notarization, or CI signing.
+
+```bash
 # After install:
 schema --version
 schema validate --config /path/to/project/schema.toml
