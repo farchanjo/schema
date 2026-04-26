@@ -12,6 +12,8 @@
 //!   - `glossary_lookup`  query restricted to kind = glossary
 //!   - `cross_reference`  `artifact_id` → referencing chunks
 //!   - `list_corpus`      debug listing
+//!   - `reset_index`      DESTRUCTIVE — wipe index + manifest (ADR-0015)
+//!   - `forget_source`    DESTRUCTIVE — drop one source path (ADR-0015)
 
 use std::sync::Arc;
 
@@ -23,6 +25,7 @@ use tracing::info;
 
 use crate::adapters::project_identity::ProjectIdentity;
 use crate::adapters::toml_config::SchemaConfig;
+use crate::app::cleanup::Cleanup;
 use crate::app::query::Query;
 use crate::domain::ChunkRecord;
 
@@ -37,12 +40,10 @@ pub struct PingParams {}
 /// Arguments for the generic `query` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueryParams {
-    /// Natural-language query. Will be embedded and matched against the
-    /// project's chunks via top-K nearest-neighbour search.
+    /// Natural-language query, e.g. 'how does session lifetime work'.
     pub query: String,
 
-    /// Optional override for top-K. Defaults to `retrieval.top_k_default`
-    /// from `schema.toml` (typically 8).
+    /// Override for K (default 8). Higher = more breadth, lower = more precision.
     #[serde(default)]
     pub top_k: Option<usize>,
 }
@@ -50,10 +51,10 @@ pub struct QueryParams {
 /// Arguments for `find_decisions` — semantic search restricted to ADR-MADR.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindDecisionsParams {
-    /// What you want to find decisions about (e.g. "session lifetime",
-    /// "step-up authentication").
+    /// What you want to find decisions about, e.g. 'session lifetime', 'step-up authentication'.
     pub query: String,
 
+    /// Override for K (default 8). Higher = more breadth, lower = more precision.
     #[serde(default)]
     pub top_k: Option<usize>,
 }
@@ -61,10 +62,10 @@ pub struct FindDecisionsParams {
 /// Arguments for `glossary_lookup` — semantic search restricted to glossary kinds.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GlossaryLookupParams {
-    /// Term to look up. The match is semantic, so synonyms work
-    /// (e.g. "RBAC" finds "role-based access control").
+    /// Term to look up, e.g. 'RBAC' or 'JWT'. Synonyms work.
     pub term: String,
 
+    /// Override for K (default 8). Higher = more breadth, lower = more precision.
     #[serde(default)]
     pub top_k: Option<usize>,
 }
@@ -88,19 +89,31 @@ pub struct CorpusListing {
 /// define it and chunks that reference it.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CrossReferenceParams {
-    /// Artifact identifier, e.g. `"ADR-0055"`. Matched exactly against
-    /// the `artifact_id` column for definitional hits, and against
-    /// `content LIKE '%id%'` (excluding the artifact's own chunks) for
-    /// referencing hits.
+    /// Artifact id, e.g. 'ADR-0055' or 'GLOSS-0012'. Exact match required.
     pub artifact_id: String,
 
-    /// Cap on returned definitional chunks. Default 16.
+    /// Cap on defining chunks (default 16). Definitions are usually 1-3.
     #[serde(default)]
     pub definition_limit: Option<usize>,
 
-    /// Cap on returned referencing chunks. Default 32.
+    /// Cap on referencing chunks (default 32). Set higher for popular ADRs that are referenced widely.
     #[serde(default)]
     pub reference_limit: Option<usize>,
+}
+
+/// Empty parameter set — `reset_index` takes no arguments.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "schemars/serde derive shapes JSON `{}`, not `null`; converting to a unit struct would change MCP request schema"
+)]
+pub struct ResetIndexParams {}
+
+/// Arguments for `forget_source` — see ADR-0015.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ForgetSourceParams {
+    /// Source path to drop, relative to the project root. Format matches `list_corpus` output. Example: 'docs/decisions/0042.md'.
+    pub path: String,
 }
 
 /// Two-sided result returned by `cross_reference`.
@@ -143,14 +156,17 @@ impl From<ChunkRecord> for ToolChunk {
 
 /// Server-side state shared by all tool handlers.
 ///
-/// Holds the read-side [`Query`] service plus project metadata. Mutating
-/// services (the [`crate::app::delta_sync::DeltaSync`]) belong to the watcher
-/// task spawned in `main`; the MCP layer itself is read-only.
+/// Holds the read-side [`Query`] service plus the destructive
+/// [`Cleanup`] service plus project metadata. The mutating
+/// [`crate::app::delta_sync::DeltaSync`] still belongs to the watcher task
+/// spawned in `main`; the MCP layer holds only the cleanup verbs that need
+/// to be reachable from the LLM (see ADR-0015).
 #[derive(Debug)]
 pub struct ServerState {
     pub config: SchemaConfig,
     pub identity: ProjectIdentity,
     pub query: Query,
+    pub cleanup: Cleanup,
 }
 
 /// The MCP server instance.
@@ -164,7 +180,7 @@ pub struct SchemaServer {
 #[tool_router(server_handler)]
 impl SchemaServer {
     /// Smoke-test tool. Returns the literal string `"pong"`.
-    #[tool(description = "Health probe for the schema MCP server. Returns \"pong\".")]
+    #[tool(description = "Liveness probe; returns 'pong'. Use as a connectivity smoke test.")]
     #[expect(
         clippy::same_name_method,
         reason = "rmcp tool_router macro generates an inner method with the same name as the user-declared tool fn"
@@ -181,7 +197,7 @@ impl SchemaServer {
     /// Generic semantic-search tool. Embeds the query string, returns top-K
     /// closest chunks.
     #[tool(
-        description = "Generic top-K semantic search over the project's indexed corpus. Returns the closest chunks (with source path + line range) for a natural-language query."
+        description = "Semantic search across the whole project corpus. Use for general questions when you don't know the kind, or when you want hits across ADRs, glossary, and prose at once. Example queries: 'how does session lifetime work', 'what is the chunking strategy for markdown'."
     )]
     async fn query(&self, Parameters(params): Parameters<QueryParams>) -> String {
         let top_k = params
@@ -198,7 +214,7 @@ impl SchemaServer {
 
     /// Semantic search restricted to ADRs (kind = adr-madr).
     #[tool(
-        description = "Top-K semantic search restricted to architectural decisions (ADRs). Use when you specifically want decisions and their rationale, not general docs."
+        description = "Semantic search restricted to architectural decisions (ADRs). Use to retrieve a decision and its rationale. Returns the ADR body plus surrounding context. Example queries: 'why did we pick LanceDB', 'what is our session lifetime policy'."
     )]
     async fn find_decisions(&self, Parameters(params): Parameters<FindDecisionsParams>) -> String {
         let top_k = params
@@ -220,7 +236,7 @@ impl SchemaServer {
 
     /// Term lookup restricted to glossary entries.
     #[tool(
-        description = "Look up a term in the project's glossary. Returns the closest matching glossary chunks (semantic match, so synonyms and related terms surface)."
+        description = "Look up a term in the project glossary. Match is semantic, so synonyms and related phrases surface — you don't need the exact word the glossary uses. Examples: 'RBAC' → 'role-based access control'. 'JWT' → 'JSON Web Token'."
     )]
     async fn glossary_lookup(
         &self,
@@ -245,7 +261,7 @@ impl SchemaServer {
 
     /// Cross-reference: artifact id → definition + referencing chunks.
     #[tool(
-        description = "Given an artifact id (e.g. \"ADR-0055\"), return both the chunks that define it (artifact_id match) and chunks that mention it elsewhere (content match). Useful for navigating decision relationships and impact analysis."
+        description = "Given an artifact id (e.g. 'ADR-0055'), return its defining chunks PLUS every chunk elsewhere in the corpus that references it. Useful for impact analysis: 'what depends on this decision'. Example: artifact_id='ADR-0055' → returns the ADR's own body and every other chunk that mentions ADR-0055 inline."
     )]
     async fn cross_reference(
         &self,
@@ -274,7 +290,7 @@ impl SchemaServer {
 
     /// Debug — list every distinct source path indexed for this project.
     #[tool(
-        description = "List every source file currently in the project's index. Useful for verifying what schema sees vs what the project ships."
+        description = "Debug — list every source path currently in the project's index. Useful for verifying that schema.toml corpus paths expanded into the files you expected. No arguments."
     )]
     async fn list_corpus(&self, _params: Parameters<ListCorpusParams>) -> String {
         match self.state.query.list_source_paths().await {
@@ -285,6 +301,36 @@ impl SchemaServer {
                 };
                 json_or_error(&listing)
             }
+            Err(e) => format_error(&format!("{e}")),
+        }
+    }
+
+    /// DESTRUCTIVE — wipe every chunk + the manifest for this project.
+    #[tool(
+        description = "DESTRUCTIVE — wipe every chunk and reset the manifest for this project. Ask the operator to confirm before calling. Use after a chunking strategy change or model swap when a full re-index is wanted. Next `schema serve` rebuilds from scratch (~30-60s for a typical corpus)."
+    )]
+    async fn reset_index(&self, _params: Parameters<ResetIndexParams>) -> String {
+        match self.state.cleanup.reset_index().await {
+            Ok(()) => json_or_error(&serde_json::json!({
+                "status": "ok",
+                "action": "reset_index",
+            })),
+            Err(e) => format_error(&format!("{e}")),
+        }
+    }
+
+    /// DESTRUCTIVE — drop chunks for one source path + drop it from the
+    /// manifest.
+    #[tool(
+        description = "DESTRUCTIVE — drop every chunk for one source path from the index. The file on disk is NOT deleted; only its chunks vanish from the index. Use when a doc has gone stale or noisy. Example: path='docs/decisions/0042-deprecated.md' removes only that file's chunks."
+    )]
+    async fn forget_source(&self, Parameters(params): Parameters<ForgetSourceParams>) -> String {
+        match self.state.cleanup.forget_source(&params.path).await {
+            Ok(()) => json_or_error(&serde_json::json!({
+                "status": "ok",
+                "action": "forget_source",
+                "path": params.path,
+            })),
             Err(e) => format_error(&format!("{e}")),
         }
     }

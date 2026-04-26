@@ -29,6 +29,7 @@ use schema::adapters::metadata_store::TomlMetadataStore;
 use schema::adapters::project_identity::ProjectIdentity;
 use schema::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_dir};
 use schema::adapters::toml_config::SchemaConfig;
+use schema::app::cleanup::Cleanup;
 use schema::app::delta_sync::{DeltaSync, corpus_paths_from_config};
 use schema::app::query::Query;
 use schema::app::watcher_consumer::run_watcher_consumer;
@@ -43,12 +44,7 @@ const WATCHER_DEBOUNCE: Duration = Duration::from_millis(500);
 /// incompatible with the restriction-group lints set to `forbid` by ADR-0012
 /// (E0453: forbid cannot be downgraded).
 fn cli() -> Command {
-    let config_arg = Arg::new("config")
-        .long("config")
-        .value_name("PATH")
-        .value_parser(clap::value_parser!(PathBuf))
-        .default_value("schema.toml");
-
+    let config_arg = config_arg();
     Command::new("schema")
         .version(env!("CARGO_PKG_VERSION"))
         .about("MCP server for indexing project specs, ADRs, and contracts")
@@ -62,7 +58,49 @@ fn cli() -> Command {
         .subcommand(
             Command::new("validate")
                 .about("Validate a `schema.toml` without starting the MCP server.")
-                .arg(config_arg),
+                .arg(config_arg.clone()),
+        )
+        .subcommand(reset_subcommand(config_arg.clone()))
+        .subcommand(forget_subcommand(config_arg))
+}
+
+/// Shared `--config` argument used by every subcommand.
+fn config_arg() -> Arg {
+    Arg::new("config")
+        .long("config")
+        .value_name("PATH")
+        .value_parser(clap::value_parser!(PathBuf))
+        .default_value("schema.toml")
+}
+
+/// `schema reset --config X --yes` (ADR-0015).
+fn reset_subcommand(config_arg: Arg) -> Command {
+    Command::new("reset")
+        .about(
+            "DESTRUCTIVE — wipe every chunk and reset the manifest for this project (ADR-0015). Requires --yes.",
+        )
+        .arg(config_arg)
+        .arg(
+            Arg::new("yes")
+                .long("yes")
+                .action(clap::ArgAction::SetTrue)
+                .help("Confirm the destructive operation. Required."),
+        )
+}
+
+/// `schema forget --config X --path Y` (ADR-0015).
+fn forget_subcommand(config_arg: Arg) -> Command {
+    Command::new("forget")
+        .about(
+            "DESTRUCTIVE — drop chunks for one source path and remove it from the manifest (ADR-0015).",
+        )
+        .arg(config_arg)
+        .arg(
+            Arg::new("path")
+                .long("path")
+                .value_name("PATH")
+                .required(true)
+                .help("Source path (relative to project root) to drop from the index."),
         )
 }
 
@@ -82,6 +120,14 @@ async fn main() -> Result<()> {
     match matches.subcommand() {
         Some(("serve", sub)) => run_serve(config_from(sub)).await,
         Some(("validate", sub)) => run_validate(&config_from(sub)),
+        Some(("reset", sub)) => run_reset(config_from(sub), sub.get_flag("yes")).await,
+        Some(("forget", sub)) => {
+            let path = sub
+                .get_one::<String>("path")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("--path is required for `schema forget`"))?;
+            run_forget(config_from(sub), path).await
+        }
         Some((other, _)) => Err(anyhow::anyhow!("unknown subcommand: {other}")),
         None => run_serve(PathBuf::from("schema.toml")).await,
     }
@@ -136,6 +182,7 @@ async fn wire_ports(cfg: &SchemaConfig, identity: &ProjectIdentity) -> Result<Wi
 struct Services {
     sync: DeltaSync,
     query: Query,
+    cleanup: Cleanup,
 }
 
 fn build_services(wiring: &Wiring) -> Services {
@@ -150,7 +197,15 @@ fn build_services(wiring: &Wiring) -> Services {
         Arc::clone(&wiring.persistence),
         Arc::clone(&wiring.embedder),
     );
-    Services { sync, query }
+    let cleanup = Cleanup::new(
+        Arc::clone(&wiring.persistence),
+        Arc::clone(&wiring.metadata),
+    );
+    Services {
+        sync,
+        query,
+        cleanup,
+    }
 }
 
 async fn run_serve(config: PathBuf) -> Result<()> {
@@ -165,7 +220,11 @@ async fn run_serve(config: PathBuf) -> Result<()> {
     );
 
     let wiring = wire_ports(&cfg, &identity).await?;
-    let Services { sync, query } = build_services(&wiring);
+    let Services {
+        sync,
+        query,
+        cleanup,
+    } = build_services(&wiring);
 
     let initial = sync.run().await?;
     tracing::info!(?initial, "initial delta-sync complete");
@@ -176,6 +235,7 @@ async fn run_serve(config: PathBuf) -> Result<()> {
         config: cfg,
         identity,
         query,
+        cleanup,
     };
     SchemaServer::with_state(state).run_stdio().await
 }
@@ -217,5 +277,58 @@ fn run_validate(config: &Path) -> Result<()> {
     for c in &cfg.corpus {
         writeln!(out, "    - {} ({:?})", c.path.display(), c.kind)?;
     }
+    Ok(())
+}
+
+/// Build a one-shot [`Cleanup`] for off-session subcommands.
+///
+/// Mirrors `run_serve`'s wiring (load config, resolve identity, ensure cache
+/// dir, open the store) but stops short of starting the MCP server, the
+/// watcher, or the initial delta-sync — those are not meaningful for a
+/// destructive cleanup verb.
+async fn build_cleanup(config: &Path) -> Result<(ProjectIdentity, Cleanup)> {
+    let cfg = SchemaConfig::load(config)?;
+    let identity =
+        ProjectIdentity::resolve(&cfg.project.name, &SchemaConfig::project_root(config)?)?;
+    identity.ensure_cache_dir()?;
+    let wiring = wire_ports(&cfg, &identity).await?;
+    let cleanup = Cleanup::new(
+        Arc::clone(&wiring.persistence),
+        Arc::clone(&wiring.metadata),
+    );
+    Ok((identity, cleanup))
+}
+
+/// `schema reset --config X --yes` — wipe every chunk + manifest entry for
+/// this project (ADR-0015). Without `--yes`, abort with a friendly message.
+async fn run_reset(config: PathBuf, confirmed: bool) -> Result<()> {
+    if !confirmed {
+        tracing::error!(
+            "`schema reset` is destructive; rerun with --yes to confirm wiping the index for this project",
+        );
+        return Err(anyhow::anyhow!("missing --yes confirmation"));
+    }
+    let (identity, cleanup) = build_cleanup(&config).await?;
+    tracing::info!(
+        project = %identity.id,
+        cache_dir = %identity.cache_dir.display(),
+        "schema reset: wiping persistence + manifest",
+    );
+    cleanup.reset_index().await?;
+    tracing::info!(project = %identity.id, "schema reset complete");
+    Ok(())
+}
+
+/// `schema forget --config X --path Y` — drop one source path from the
+/// index + manifest (ADR-0015).
+async fn run_forget(config: PathBuf, path: String) -> Result<()> {
+    let (identity, cleanup) = build_cleanup(&config).await?;
+    tracing::info!(
+        project = %identity.id,
+        path = %path,
+        "schema forget: dropping path from index + manifest",
+    );
+    cleanup.forget_source(&path).await?;
+    tracing::info!(project = %identity.id, path = %path, "schema forget complete");
     Ok(())
 }

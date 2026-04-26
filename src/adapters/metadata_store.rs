@@ -42,6 +42,10 @@ impl MetadataStore for TomlMetadataStore {
         fs::write(&self.path, raw)?;
         Ok(())
     }
+
+    fn reset(&self) -> Result<(), MetadataStoreError> {
+        self.save(&Metadata::default())
+    }
 }
 
 /// Compute the BLAKE3 hex digest of a file's content.
@@ -109,5 +113,35 @@ mod tests {
         let store = TomlMetadataStore::new(tmp.path().join("nope.toml"));
         let meta = store.load().unwrap();
         assert!(meta.files.is_empty());
+    }
+
+    /// Build a [`FileMeta`] with the given fields.
+    fn meta(mtime: i64, size: u64, hash: &str, chunks: usize) -> FileMeta {
+        FileMeta {
+            mtime,
+            size_bytes: size,
+            content_hash: hash.into(),
+            chunk_count: chunks,
+        }
+    }
+
+    /// ADR-0015 fitness function — `reset` overwrites the manifest with
+    /// `Metadata::default()`.
+    #[test]
+    fn reset_writes_default_manifest() {
+        let tmp = TempDir::new().unwrap();
+        let store = TomlMetadataStore::new(tmp.path().join("metadata.toml"));
+
+        let mut seeded = Metadata::default();
+        seeded.upsert(&PathBuf::from("a.md"), meta(1, 10, "aaa", 1));
+        seeded.upsert(&PathBuf::from("b.md"), meta(2, 20, "bbb", 2));
+        store.save(&seeded).unwrap();
+        assert_eq!(store.load().unwrap().files.len(), 2);
+
+        store.reset().unwrap();
+
+        let after = store.load().unwrap();
+        assert!(after.files.is_empty(), "reset must drop every file entry");
+        assert_eq!(after.version, 1, "default version must be 1");
     }
 }

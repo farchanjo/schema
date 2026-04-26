@@ -294,6 +294,18 @@ cleanup before upgrading is acceptable for v0.2.
   "multi_thread")`; reads succeed throughout, no
   `SQLITE_BUSY`, count monotonic non-decreasing). Test count
   went from 27 → 31._
+- _2026-04-25 — **Cleanup tools (PR2) follow-up satisfied by
+  ADR-0015.** The follow-up bullet `Cleanup tools (PR2)` above is
+  closed: `Cleanup::reset_index` (DELETE + VACUUM) and
+  `Cleanup::forget_source` (per-path DELETE) are now exposed at
+  both the MCP layer (`reset_index`, `forget_source` tools, both
+  with a `DESTRUCTIVE` description prefix) and the CLI layer
+  (`schema reset --yes`, `schema forget --path`). Both layers
+  share `crate::app::cleanup::Cleanup` so the verbs have a single
+  testable use case (see ADR-0015 fitness function). The new
+  port methods (`Persistence::reset_all`, `MetadataStore::reset`)
+  are minimal extensions of the existing traits. Test count rose
+  from 31 → 36._
 - _2026-04-25 — **Surprising finding: `sqlite-vec` 0.1.9 has
   no safe loader.** The published crate exposes only the raw
   `extern "C" fn sqlite3_vec_init()` symbol; the

@@ -399,6 +399,33 @@ impl Persistence for SqliteVecStore {
         drop(guard);
         Ok(rows)
     }
+
+    async fn reset_all(&self) -> Result<(), PersistenceError> {
+        let guard = self.conn.lock().await;
+        let removed = run_reset_all(&guard)?;
+        drop(guard);
+        info!(
+            rows_deleted = removed,
+            "sqlite-vec store reset (DELETE + VACUUM)"
+        );
+        Ok(())
+    }
+}
+
+/// Bulk-delete every row in `chunks` and reclaim disk pages with `VACUUM`.
+///
+/// Returns the number of rows that existed before the wipe (logged by the
+/// caller). The deletes cascade to `chunks_vec` and `chunks_fts` via the
+/// triggers defined in [`DDL_VEC_TRIGGER`] / [`DDL_FTS_TRIGGERS`]; `VACUUM`
+/// is intentionally outside any transaction (`SQLite` forbids `VACUUM` inside
+/// one).
+fn run_reset_all(conn: &Connection) -> Result<i64, PersistenceError> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0))
+        .map_err(sqlite_err)?;
+    conn.execute("DELETE FROM chunks", []).map_err(sqlite_err)?;
+    conn.execute_batch("VACUUM").map_err(sqlite_err)?;
+    Ok(count)
 }
 
 const SQL_INSERT_CHUNK: &str = "INSERT INTO chunks (id, source_path, line_start, line_end, \
@@ -956,6 +983,92 @@ mod tests {
             last_b = b;
             sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Read the row count of a virtual table via a fresh read-only handle.
+    /// Helper for `reset_all_wipes_chunks_and_cascades_triggers`.
+    fn read_only_count(db_path: &Path, table: &str) -> i64 {
+        use rusqlite::OpenFlags;
+        let ro = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        ro.query_row(&sql, [], |r| r.get(0)).unwrap()
+    }
+
+    /// ADR-0015 — single-path delete preserves siblings.
+    ///
+    /// Validates that the persistence half of `Cleanup::forget_source`
+    /// (`delete_by_source(&[path])`) drops only the named source path
+    /// from `chunks` AND the FTS5 cascade trigger fires for that one
+    /// path while leaving siblings untouched in both row store and FTS5.
+    #[tokio::test]
+    async fn delete_by_source_one_path_preserves_others() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("store.db");
+        let store = SqliteVecStore::open(&db_path).await.unwrap();
+        store.ensure_ready().await.unwrap();
+
+        let chunks = vec![
+            sample_chunk("a.md", Some("ADR-A"), "alpha mention"),
+            sample_chunk("b.md", Some("ADR-B"), "beta mention"),
+            sample_chunk("c.md", Some("ADR-C"), "charlie mention"),
+        ];
+        let vectors = vec![dummy_vec(), dummy_vec(), dummy_vec()];
+        store.append_chunks(&chunks, &vectors).await.unwrap();
+
+        store.delete_by_source(&["b.md"]).await.unwrap();
+
+        let paths = store.list_source_paths().await.unwrap();
+        assert_eq!(
+            paths,
+            vec!["a.md".to_string(), "c.md".to_string()],
+            "only b.md must be gone"
+        );
+        // FTS5 cascade: 'beta' must yield 0 hits while 'alpha'/'charlie' still resolve.
+        let beta_hits = store.find_mentioning("beta", 10).await.unwrap();
+        assert!(beta_hits.is_empty(), "FTS5 must drop b.md's row");
+        let alpha_hits = store.find_mentioning("alpha", 10).await.unwrap();
+        assert_eq!(alpha_hits.len(), 1);
+        assert_eq!(alpha_hits[0].source_path, "a.md");
+    }
+
+    /// ADR-0015 fitness function — `reset_all` wipes every row in `chunks`
+    /// and the FTS5 / vec0 trigger cascades fire on the bulk delete.
+    #[tokio::test]
+    async fn reset_all_wipes_chunks_and_cascades_triggers() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("store.db");
+        let store = SqliteVecStore::open(&db_path).await.unwrap();
+        store.ensure_ready().await.unwrap();
+
+        let chunks = vec![
+            sample_chunk("a.md", Some("ADR-A"), "alpha bravo"),
+            sample_chunk("b.md", Some("ADR-B"), "charlie delta"),
+            sample_chunk("c.md", Some("ADR-C"), "echo foxtrot"),
+        ];
+        let vectors = vec![dummy_vec(), dummy_vec(), dummy_vec()];
+        store.append_chunks(&chunks, &vectors).await.unwrap();
+        assert_eq!(store.list_source_paths().await.unwrap().len(), 3);
+        // Sanity: FTS5 also has rows before reset.
+        assert_eq!(read_only_count(&db_path, "chunks_fts"), 3);
+
+        store.reset_all().await.unwrap();
+
+        let paths = store.list_source_paths().await.unwrap();
+        assert!(
+            paths.is_empty(),
+            "reset_all must wipe chunks, got {paths:?}"
+        );
+        assert_eq!(
+            read_only_count(&db_path, "chunks_fts"),
+            0,
+            "FTS5 cascade trigger must clear chunks_fts on reset"
+        );
+        // Re-using the store after reset must work: insert a new chunk + read it back.
+        let post = vec![sample_chunk("post.md", Some("ADR-POST"), "post-reset")];
+        let post_vec = vec![dummy_vec()];
+        store.append_chunks(&post, &post_vec).await.unwrap();
+        let paths = store.list_source_paths().await.unwrap();
+        assert_eq!(paths, vec!["post.md".to_string()]);
     }
 
     #[tokio::test(flavor = "multi_thread")]

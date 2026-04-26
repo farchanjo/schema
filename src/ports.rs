@@ -47,6 +47,18 @@ pub trait Persistence: Send + Sync {
     /// Delete every chunk whose `source_path` matches one of `paths`.
     async fn delete_by_source(&self, paths: &[&str]) -> Result<(), PersistenceError>;
 
+    /// Wipe every chunk from the store and reclaim the disk pages.
+    ///
+    /// Implementations should perform a bulk `DELETE FROM chunks` (which
+    /// cascades to companion virtual tables via existing triggers) followed
+    /// by `VACUUM` (or the equivalent reclaim step) so the on-disk file does
+    /// not retain dead pages. The store file is kept open; only its contents
+    /// are emptied.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying delete fails.
+    async fn reset_all(&self) -> Result<(), PersistenceError>;
+
     /// Top-K nearest-neighbour query. Optionally filtered by `kind`.
     async fn query_nearest(
         &self,
@@ -225,4 +237,15 @@ pub trait MetadataStore: Send + Sync {
     /// Returns an error if the parent directory cannot be created, the
     /// manifest cannot be serialised, or the file cannot be written.
     fn save(&self, metadata: &Metadata) -> Result<(), MetadataStoreError>;
+
+    /// Overwrite the manifest with [`Metadata::default`].
+    ///
+    /// Equivalent to `save(&Metadata::default())`; exposed as a dedicated
+    /// method so the cleanup use case has a single, intention-revealing
+    /// call site that adapters can specialise (e.g. to delete the file
+    /// instead of writing an empty one) without changing callers.
+    ///
+    /// # Errors
+    /// Returns an error if the manifest cannot be written.
+    fn reset(&self) -> Result<(), MetadataStoreError>;
 }

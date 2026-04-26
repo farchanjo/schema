@@ -425,6 +425,13 @@ mod tests {
             paths.dedup();
             Ok(paths)
         }
+
+        async fn reset_all(&self) -> Result<(), PersistenceError> {
+            let mut rows = self.rows.lock().unwrap();
+            rows.clear();
+            drop(rows);
+            Ok(())
+        }
     }
 
     /// Deterministic `Embedder` fake — produces a unit vector per input
@@ -497,6 +504,10 @@ mod tests {
             *guard = metadata.clone();
             drop(guard);
             Ok(())
+        }
+
+        fn reset(&self) -> Result<(), MetadataStoreError> {
+            self.save(&Metadata::default())
         }
     }
 

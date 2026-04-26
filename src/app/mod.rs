@@ -5,6 +5,7 @@
 //! `crate::app::delta_sync::DeltaSync`, `crate::app::query::Query`, etc. No
 //! `pub use` flattening (the `pub_use` lint blocks it project-wide).
 
+pub mod cleanup;
 pub mod delta_sync;
 pub mod query;
 pub mod watcher_consumer;
