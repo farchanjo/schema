@@ -35,3 +35,6 @@ pointing at the CI check that proves the decision is still in effect.
 | 0011 | [SQLite + `sqlite-vec` embedded store](./0011-sqlite-vec-store.md)                       | accepted | 2026-04-25 |
 | 0012 | [Strict lint baseline (Layer A `forbid` + Layer B activation)](./0012-strict-lint-baseline.md) | accepted | 2026-04-25 |
 | 0013 | [Hexagonal architecture (ports & adapters)](./0013-hexagonal-architecture.md)            | accepted | 2026-04-25 |
+| 0014 | [Install at `/usr/local/bin` + Apple codesign on macOS](./0014-install-and-codesign.md)  | accepted | 2026-04-25 |
+| 0015 | [Cleanup tools at both MCP and CLI surfaces](./0015-cleanup-tools.md)                     | accepted | 2026-04-25 |
+| 0016 | [MCP tool description style: verb + example + safety hint](./0016-mcp-tool-description-style.md) | accepted | 2026-04-25 |
