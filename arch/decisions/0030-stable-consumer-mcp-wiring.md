@@ -330,3 +330,25 @@ We adopt **option (d)**.
   Validation gate green: 114 tests, fmt, clippy `-D warnings`.
   Runbook §4 promoted Shape B (`--shim`) to canonical and
   marked Shape A `legacy / per-restart`.
+
+- **2026-04-27 — fix: rmcp `mcp-session-id` propagation +
+  notification suppression.** Initial implementation only
+  forwarded the bearer; subsequent POSTs after `initialize`
+  hit `422 Unprocessable Entity — Unexpected message, expect
+  initialize request` because rmcp's `StreamableHttpService`
+  requires the `mcp-session-id` header (minted on the
+  `initialize` response, replayed on every subsequent POST).
+  The shim now holds a `SessionState` across calls,
+  captures the header on every response, and replays it on
+  every request. Notifications (`notifications/*`) elicit
+  `202 Accepted` / `204 No Content` and an empty body from
+  rmcp; the shim now interprets those as "no JSON-RPC reply
+  to forward" and skips writing to stdout instead of
+  emitting a stray empty line. Added integration test
+  `session_id_is_captured_and_replayed` (axum mock that
+  mints a sid on the first call and rejects subsequent
+  calls without it). End-to-end smoke against the live
+  daemon now completes the full MCP handshake
+  (`initialize` → `notifications/initialized` → `ping`)
+  with the right number of stdout frames. Validation gate
+  green: 130 tests, fmt, clippy `-D warnings`.

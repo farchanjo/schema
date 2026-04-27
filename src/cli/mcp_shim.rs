@@ -25,10 +25,19 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use reqwest::StatusCode;
-use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, HeaderName, HeaderValue};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, stdin, stdout};
 
 use crate::adapters::endpoint_toml::Endpoint;
+
+/// HTTP header carrying the `rmcp` `StreamableHttp` session id. The daemon
+/// emits this header on the response to `initialize` and requires it on
+/// every subsequent POST to /mcp; without it the daemon answers
+/// `422 Unprocessable Entity — Unexpected message, expect initialize
+/// request`. The shim caches the value across calls so Claude Code's
+/// `initialize → notifications/initialized → tools/call` sequence
+/// stitches across the per-request POST/HTTP boundary.
+const MCP_SESSION_HEADER: &str = "mcp-session-id";
 
 /// Reqwest client timeout per forwarded request. `synthesize` calls can
 /// be long-running (LLM round-trip); 2 minutes leaves headroom without
@@ -77,6 +86,7 @@ async fn bridge_loop(
     let mut reader = BufReader::new(stdin());
     let mut writer = stdout();
     let mut line = String::new();
+    let mut session = SessionState::default();
     loop {
         line.clear();
         let read = reader
@@ -91,9 +101,21 @@ async fn bridge_loop(
         if trimmed.is_empty() {
             continue;
         }
-        let body = forward_with_retry(client, endpoint, endpoint_path, trimmed).await?;
-        write_frame(&mut writer, &body).await?;
+        let outcome =
+            forward_with_retry(client, endpoint, endpoint_path, trimmed, &mut session).await?;
+        if let Some(body) = outcome {
+            write_frame(&mut writer, &body).await?;
+        }
     }
+}
+
+/// Cross-call state the shim holds between POSTs. Currently only the
+/// `rmcp` `StreamableHttp` session id; future fields (e.g., last-event-id
+/// for resumable streams) extend this without changing the bridge
+/// contract.
+#[derive(Debug, Default)]
+struct SessionState {
+    session_id: Option<HeaderValue>,
 }
 
 async fn write_frame<W>(writer: &mut W, body: &str) -> Result<()>
@@ -116,12 +138,15 @@ async fn forward_with_retry(
     endpoint: &mut Endpoint,
     endpoint_path: &Path,
     body: &str,
-) -> Result<String> {
-    match forward_request(client, endpoint, body).await {
+    session: &mut SessionState,
+) -> Result<Option<String>> {
+    match forward_request(client, endpoint, body, session).await {
         Ok(text) => Ok(text),
-        Err(BridgeError::Reauth) => retry_after_reauth(client, endpoint, endpoint_path, body).await,
+        Err(BridgeError::Reauth) => {
+            retry_after_reauth(client, endpoint, endpoint_path, body, session).await
+        }
         Err(BridgeError::Unreachable(err)) => {
-            retry_after_unreachable(client, endpoint, endpoint_path, body, err).await
+            retry_after_unreachable(client, endpoint, endpoint_path, body, err, session).await
         }
         Err(BridgeError::Other(err)) => Err(err),
     }
@@ -132,10 +157,11 @@ async fn retry_after_reauth(
     endpoint: &mut Endpoint,
     endpoint_path: &Path,
     body: &str,
-) -> Result<String> {
+    session: &mut SessionState,
+) -> Result<Option<String>> {
     tracing::warn!("mcp-shim: 401 from daemon, re-reading endpoint.toml");
     *endpoint = load_endpoint(endpoint_path)?;
-    forward_request(client, endpoint, body)
+    forward_request(client, endpoint, body, session)
         .await
         .map_err(map_retry_after_reauth_error)
 }
@@ -160,10 +186,11 @@ async fn retry_after_unreachable(
     endpoint_path: &Path,
     body: &str,
     cause: reqwest::Error,
-) -> Result<String> {
+    session: &mut SessionState,
+) -> Result<Option<String>> {
     tracing::warn!(error = %cause, "mcp-shim: daemon unreachable, re-reading endpoint.toml");
     *endpoint = load_endpoint(endpoint_path)?;
-    forward_request(client, endpoint, body)
+    forward_request(client, endpoint, body, session)
         .await
         .map_err(map_retry_after_unreachable_error)
 }
@@ -196,11 +223,10 @@ async fn forward_request(
     client: &reqwest::Client,
     endpoint: &Endpoint,
     body: &str,
-) -> Result<String, BridgeError> {
-    let response = match send_post(client, endpoint, body).await {
-        Ok(r) => r,
-        Err(err) => return Err(err),
-    };
+    session: &mut SessionState,
+) -> Result<Option<String>, BridgeError> {
+    let response = send_post(client, endpoint, body, session).await?;
+    capture_session_id(&response, session);
     interpret_response(response).await
 }
 
@@ -208,30 +234,50 @@ async fn send_post(
     client: &reqwest::Client,
     endpoint: &Endpoint,
     body: &str,
+    session: &SessionState,
 ) -> Result<reqwest::Response, BridgeError> {
-    client
+    let mut req = client
         .post(&endpoint.url)
         .header(AUTHORIZATION, format!("Bearer {}", endpoint.token))
         .header(CONTENT_TYPE, "application/json")
         .header(ACCEPT, "application/json, text/event-stream")
-        .body(body.to_owned())
-        .send()
-        .await
-        .map_err(|err| {
-            if err.is_connect() || err.is_timeout() {
-                BridgeError::Unreachable(err)
-            } else {
-                BridgeError::Other(anyhow::Error::from(err))
-            }
-        })
+        .body(body.to_owned());
+    if let Some(sid) = session.session_id.as_ref() {
+        req = req.header(HeaderName::from_static(MCP_SESSION_HEADER), sid);
+    }
+    req.send().await.map_err(|err| {
+        if err.is_connect() || err.is_timeout() {
+            BridgeError::Unreachable(err)
+        } else {
+            BridgeError::Other(anyhow::Error::from(err))
+        }
+    })
 }
 
-async fn interpret_response(response: reqwest::Response) -> Result<String, BridgeError> {
+fn capture_session_id(response: &reqwest::Response, session: &mut SessionState) {
+    if let Some(value) = response.headers().get(MCP_SESSION_HEADER)
+        && session.session_id.as_ref() != Some(value)
+    {
+        tracing::debug!(
+            session_id = ?value,
+            "mcp-shim: captured rmcp session id"
+        );
+        session.session_id = Some(value.clone());
+    }
+}
+
+async fn interpret_response(response: reqwest::Response) -> Result<Option<String>, BridgeError> {
     if response.status() == StatusCode::UNAUTHORIZED {
         return Err(BridgeError::Reauth);
     }
-    if !response.status().is_success() {
-        let status = response.status();
+    let status = response.status();
+    if status == StatusCode::ACCEPTED || status == StatusCode::NO_CONTENT {
+        // rmcp answers `notifications/*` with 202/204 and no body —
+        // there is no JSON-RPC reply to forward to stdout.
+        drop(response.bytes().await);
+        return Ok(None);
+    }
+    if !status.is_success() {
         let text = response.text().await.unwrap_or_default();
         return Err(BridgeError::Other(anyhow::anyhow!(
             "mcp-shim: daemon returned {status} for POST /mcp: {text}"
@@ -242,10 +288,13 @@ async fn interpret_response(response: reqwest::Response) -> Result<String, Bridg
         .text()
         .await
         .map_err(|e| BridgeError::Other(anyhow::Error::from(e)))?;
+    if raw.is_empty() {
+        return Ok(None);
+    }
     if content_type.contains("text/event-stream") {
-        Ok(extract_first_sse_data(&raw).unwrap_or(raw))
+        Ok(Some(extract_first_sse_data(&raw).unwrap_or(raw)))
     } else {
-        Ok(raw)
+        Ok(Some(raw))
     }
 }
 
@@ -326,9 +375,10 @@ mod tests {
 
     use std::net::SocketAddr;
     use std::path::PathBuf;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use axum::http::HeaderMap;
+    use axum::response::Response;
     use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::post};
     use tempfile::TempDir;
     use tokio::net::TcpListener;
@@ -406,11 +456,105 @@ mod tests {
             started_at: "2026-04-27T11:00:00+00:00".to_owned(),
         };
         let client = build_client().unwrap();
-        let result = forward_with_retry(&client, &mut stale, &endpoint_path, "{}")
+        let mut session = SessionState::default();
+        let result = forward_with_retry(&client, &mut stale, &endpoint_path, "{}", &mut session)
             .await
             .unwrap();
-        assert_eq!(result, body);
+        assert_eq!(result.as_deref(), Some(body));
         assert_eq!(stale.token, "token-B");
+    }
+
+    #[derive(Clone)]
+    struct SessionMockState {
+        minted: Arc<StdMutex<Option<String>>>,
+    }
+
+    fn session_router() -> Router {
+        let state = SessionMockState {
+            minted: Arc::new(StdMutex::new(None)),
+        };
+        Router::new()
+            .route("/mcp", post(session_handler))
+            .with_state(state)
+    }
+
+    async fn session_handler(
+        State(state): State<SessionMockState>,
+        headers: HeaderMap,
+        _body: String,
+    ) -> Response {
+        let supplied = headers
+            .get(MCP_SESSION_HEADER)
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_owned);
+        let existing = {
+            let guard = state.minted.lock().unwrap();
+            guard.clone()
+        };
+        if let Some(existing) = existing {
+            return session_followup_response(&existing, supplied.as_deref());
+        }
+        let sid = "test-session-7777".to_owned();
+        *state.minted.lock().unwrap() = Some(sid.clone());
+        session_initial_response(&sid)
+    }
+
+    fn session_followup_response(existing: &str, supplied: Option<&str>) -> Response {
+        if supplied == Some(existing) {
+            (
+                StatusCode::OK,
+                [(CONTENT_TYPE, "application/json")],
+                r#"{"jsonrpc":"2.0","id":2,"result":{"ok":"replayed"}}"#,
+            )
+                .into_response()
+        } else {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                [(CONTENT_TYPE, "application/json")],
+                r#"{"error":"missing or wrong mcp-session-id"}"#,
+            )
+                .into_response()
+        }
+    }
+
+    fn session_initial_response(sid: &str) -> Response {
+        let mut head = HeaderMap::new();
+        head.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        head.insert(MCP_SESSION_HEADER, sid.parse().unwrap());
+        (
+            StatusCode::OK,
+            head,
+            r#"{"jsonrpc":"2.0","id":1,"result":{"ok":"first"}}"#,
+        )
+            .into_response()
+    }
+
+    #[tokio::test]
+    async fn session_id_is_captured_and_replayed() {
+        let url = spawn_mock(session_router()).await;
+        let dir = TempDir::new().unwrap();
+        let endpoint_path = write_endpoint(&dir, &url, "any");
+        let mut endpoint = Endpoint {
+            version: 1,
+            url: url.clone(),
+            token: "any".to_owned(),
+            pid: 1,
+            started_at: "2026-04-27T12:00:00+00:00".to_owned(),
+        };
+        let client = build_client().unwrap();
+        let mut session = SessionState::default();
+        let first = forward_with_retry(&client, &mut endpoint, &endpoint_path, "{}", &mut session)
+            .await
+            .unwrap();
+        assert!(first.unwrap().contains(r#""ok":"first""#));
+        assert!(session.session_id.is_some(), "first call must capture sid");
+        let second = forward_with_retry(&client, &mut endpoint, &endpoint_path, "{}", &mut session)
+            .await
+            .unwrap();
+        assert!(
+            second.unwrap().contains(r#""ok":"replayed""#),
+            "second call must replay the captured sid and succeed"
+        );
     }
 
     #[tokio::test]
@@ -431,10 +575,11 @@ mod tests {
             started_at: "2026-04-27T11:00:00+00:00".to_owned(),
         };
         let client = build_client().unwrap();
-        let result = forward_with_retry(&client, &mut stale, &endpoint_path, "{}")
+        let mut session = SessionState::default();
+        let result = forward_with_retry(&client, &mut stale, &endpoint_path, "{}", &mut session)
             .await
             .unwrap();
-        assert_eq!(result, body);
+        assert_eq!(result.as_deref(), Some(body));
         assert_eq!(stale.url, live_url);
     }
 }
