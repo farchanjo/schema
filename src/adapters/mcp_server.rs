@@ -19,7 +19,6 @@
 //!   - `reset_index`        DESTRUCTIVE — wipe index + manifest (ADR-0015)
 //!   - `forget_source`      DESTRUCTIVE — drop one source path (ADR-0015)
 
-use std::fmt;
 use std::iter;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,15 +37,19 @@ use tower_http::trace::TraceLayer;
 use tower_http::validate_request::ValidateRequestHeaderLayer;
 use tracing::info;
 
+use std::path::Path;
+
 use crate::adapters::auth::BearerValidator;
-use crate::adapters::project_identity::ProjectIdentity;
-use crate::adapters::toml_config::SchemaConfig;
-use crate::app::cleanup::Cleanup;
-use crate::app::query::Query;
-use crate::app::synthesize::{Citation, Synthesize, SynthesizeOutput};
+use crate::app::daemon::Daemon;
+use crate::app::project_instance::ProjectInstance;
+use crate::app::synthesize::{Citation, SynthesizeOutput};
 use crate::domain::ChunkRecord;
 
 /// Empty parameter set — `ping` takes no arguments.
+///
+/// `ping` is the only project-less tool: it answers "is the daemon
+/// up?" and does not need a `working_directory` because it never
+/// touches any project's data.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[expect(
     clippy::empty_structs_with_brackets,
@@ -54,13 +57,14 @@ use crate::domain::ChunkRecord;
 )]
 pub struct PingParams {}
 
-/// Empty parameter set — `workspace_context` takes no arguments.
+/// Arguments for `workspace_context` — see [`WorkspaceContext`].
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[expect(
-    clippy::empty_structs_with_brackets,
-    reason = "schemars/serde derive shapes JSON `{}`, not `null`; converting to a unit struct would change MCP request schema"
-)]
-pub struct WorkspaceContextParams {}
+pub struct WorkspaceContextParams {
+    /// Absolute path the LLM is currently working in. The daemon
+    /// walks up from this directory looking for a `schema.toml` to
+    /// resolve the project (ADR-0027 §"Decision"). Required.
+    pub working_directory: String,
+}
 
 /// Reply for `workspace_context` — answers "where am I?".
 ///
@@ -116,6 +120,10 @@ pub struct EmbeddingContext {
 /// Arguments for the `synthesize` MCP tool (ADR-0025).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SynthesizeParams {
+    /// Absolute path the LLM is currently working in. See
+    /// [`WorkspaceContextParams::working_directory`].
+    pub working_directory: String,
+
     /// Natural-language question to answer over the indexed corpus.
     /// Example: "What did ADR-0019 decide about transport?".
     pub query: String,
@@ -189,6 +197,10 @@ impl From<Citation> for SynthesizeCitation {
 /// Arguments for the generic `query` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct QueryParams {
+    /// Absolute path the LLM is currently working in. See
+    /// [`WorkspaceContextParams::working_directory`].
+    pub working_directory: String,
+
     /// Natural-language query, e.g. 'how does session lifetime work'.
     pub query: String,
 
@@ -200,6 +212,10 @@ pub struct QueryParams {
 /// Arguments for `find_decisions` — semantic search restricted to ADR-MADR.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FindDecisionsParams {
+    /// Absolute path the LLM is currently working in. See
+    /// [`WorkspaceContextParams::working_directory`].
+    pub working_directory: String,
+
     /// What you want to find decisions about, e.g. 'session lifetime', 'step-up authentication'.
     pub query: String,
 
@@ -211,6 +227,10 @@ pub struct FindDecisionsParams {
 /// Arguments for `glossary_lookup` — semantic search restricted to glossary kinds.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GlossaryLookupParams {
+    /// Absolute path the LLM is currently working in. See
+    /// [`WorkspaceContextParams::working_directory`].
+    pub working_directory: String,
+
     /// Term to look up, e.g. 'RBAC' or 'JWT'. Synonyms work.
     pub term: String,
 
@@ -219,13 +239,13 @@ pub struct GlossaryLookupParams {
     pub top_k: Option<usize>,
 }
 
-/// Empty parameter set — `list_corpus` takes no arguments.
+/// Arguments for `list_corpus`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[expect(
-    clippy::empty_structs_with_brackets,
-    reason = "schemars/serde derive shapes JSON `{}`, not `null`; converting to a unit struct would change MCP request schema"
-)]
-pub struct ListCorpusParams {}
+pub struct ListCorpusParams {
+    /// Absolute path the LLM is currently working in. See
+    /// [`WorkspaceContextParams::working_directory`].
+    pub working_directory: String,
+}
 
 /// Result of `list_corpus`.
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -238,6 +258,10 @@ pub struct CorpusListing {
 /// define it and chunks that reference it.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CrossReferenceParams {
+    /// Absolute path the LLM is currently working in. See
+    /// [`WorkspaceContextParams::working_directory`].
+    pub working_directory: String,
+
     /// Artifact id, e.g. 'ADR-0055' or 'GLOSS-0012'. Exact match required.
     pub artifact_id: String,
 
@@ -250,17 +274,23 @@ pub struct CrossReferenceParams {
     pub reference_limit: Option<usize>,
 }
 
-/// Empty parameter set — `reset_index` takes no arguments.
+/// Arguments for `reset_index` (ADR-0015 + ADR-0027).
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[expect(
-    clippy::empty_structs_with_brackets,
-    reason = "schemars/serde derive shapes JSON `{}`, not `null`; converting to a unit struct would change MCP request schema"
-)]
-pub struct ResetIndexParams {}
+pub struct ResetIndexParams {
+    /// Absolute path the LLM is currently working in. The reset
+    /// scopes to the project resolved from this directory — other
+    /// projects' indexes are untouched (ADR-0008 isolation
+    /// preserved).
+    pub working_directory: String,
+}
 
 /// Arguments for `forget_source` — see ADR-0015.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ForgetSourceParams {
+    /// Absolute path the LLM is currently working in. See
+    /// [`WorkspaceContextParams::working_directory`].
+    pub working_directory: String,
+
     /// Source path to drop, relative to the project root. Format matches `list_corpus` output. Example: 'docs/decisions/0042.md'.
     pub path: String,
 }
@@ -303,87 +333,44 @@ impl From<ChunkRecord> for ToolChunk {
     }
 }
 
-/// Server-side state shared by all tool handlers.
+/// MCP server instance — workstation-level under ADR-0027.
 ///
-/// Holds the read-side [`Query`] service plus the destructive
-/// [`Cleanup`] service plus project metadata. The mutating
-/// [`crate::app::delta_sync::DeltaSync`] still belongs to the watcher task
-/// spawned in `main`; the MCP layer holds only the cleanup verbs that need
-/// to be reachable from the LLM (see ADR-0015).
-#[derive(Debug)]
-pub struct ServerState {
-    pub config: SchemaConfig,
-    pub identity: ProjectIdentity,
-    pub query: Query,
-    pub cleanup: Cleanup,
-    /// `Some` when ADR-0025 [`LlmProvider`](crate::ports::LlmProvider) is
-    /// wired (Anthropic / `OpenAI`); `None` triggers the `synthesize`
-    /// runtime-disabled path.
-    pub synthesize: Option<Synthesize>,
-}
-
-/// The MCP server instance.
+/// Holds an `Arc<Daemon>` (the daemon owns the shared `Embedder`,
+/// optional shared `LlmProvider`, and the lazy
+/// `Map<ProjectId, Arc<ProjectInstance>>`). Each tool call carries
+/// a `working_directory` parameter the handler walks up via
+/// [`Daemon::resolve_or_wire`] to dispatch to the matching project.
 ///
-/// Cloning is cheap (clones the Arc); rmcp clones the server per request.
+/// Cloning is cheap (clones the `Arc`); rmcp clones the server per
+/// request.
 #[derive(Clone, Debug)]
 pub struct SchemaServer {
-    state: Arc<ServerState>,
+    daemon: Arc<Daemon>,
 }
 
 #[tool_router(server_handler)]
 impl SchemaServer {
-    /// Reports the project this MCP server is bound to, so the LLM
-    /// (Claude Code) can orient itself when ENV overrides or
-    /// `.mcp.json` misconfiguration would otherwise leave it
-    /// guessing (ADR-0009 amendment, motivated by ADR-0023).
+    /// Reports project context resolved from `working_directory`,
+    /// so the LLM (Claude Code) can confirm the daemon picked up
+    /// the right `schema.toml` (ADR-0009 amendment, motivated by
+    /// ADR-0027 walk-up resolution).
     #[tool(
-        description = "Returns project context for this schema MCP server: project name + id + version, project root path, cache directory, registered corpus paths, and embedding model. Useful as a sanity check at session start ('what am I connected to?') and for debugging .mcp.json wiring. No arguments."
+        description = "Returns project context resolved from the supplied working_directory: project name + id + version, project root path, cache directory, registered corpus paths, and embedding model. Useful as a sanity check at session start ('what am I connected to?') and for confirming the daemon walked up to the right schema.toml."
     )]
-    async fn workspace_context(&self, _params: Parameters<WorkspaceContextParams>) -> String {
-        use crate::adapters::fastembed_embedder::BGE_M3_DIMENSIONS;
-
-        let state = &self.state;
-        let project = ProjectContext {
-            name: state.config.project.name.clone(),
-            id: state.identity.id.to_string(),
-            version: state.config.project.version.clone(),
-            root: state.identity.root.display().to_string(),
-            cache_dir: state.identity.cache_dir.display().to_string(),
+    async fn workspace_context(
+        &self,
+        Parameters(params): Parameters<WorkspaceContextParams>,
+    ) -> String {
+        let project = match self.resolve(&params.working_directory).await {
+            Ok(project) => project,
+            Err(message) => return format_error(&message),
         };
-        let corpus: Vec<CorpusEntry> = state
-            .config
-            .corpus
-            .iter()
-            .map(|c| CorpusEntry {
-                path: c.path.display().to_string(),
-                kind: format!("{:?}", c.kind),
-            })
-            .collect();
-        let embedding = EmbeddingContext {
-            model: state.config.embedding.model.clone(),
-            dims: BGE_M3_DIMENSIONS,
-        };
-        let llm = state.synthesize.as_ref().map_or(
-            LlmContext {
-                active: false,
-                provider: None,
-                model: None,
-            },
-            |synth| LlmContext {
-                active: true,
-                provider: Some(synth.provider_name().to_string()),
-                model: Some(synth.model()),
-            },
-        );
-        json_or_error(&WorkspaceContext {
-            project,
-            corpus,
-            embedding,
-            llm,
-        })
+        json_or_error(&build_workspace_context(&project))
     }
 
-    /// Smoke-test tool. Returns the literal string `"pong"`.
+    /// Smoke-test tool. Returns the literal string `"pong"`. The only
+    /// project-less tool — useful as a daemon liveness probe before
+    /// the LLM has a `working_directory` to supply.
     #[tool(description = "Liveness probe; returns 'pong'. Use as a connectivity smoke test.")]
     #[expect(
         clippy::same_name_method,
@@ -401,13 +388,17 @@ impl SchemaServer {
     /// Generic semantic-search tool. Embeds the query string, returns top-K
     /// closest chunks.
     #[tool(
-        description = "Semantic search across the whole project corpus. Use for general questions when you don't know the kind, or when you want hits across ADRs, glossary, and prose at once. Example queries: 'how does session lifetime work', 'what is the chunking strategy for markdown'."
+        description = "Semantic search across the project corpus resolved from working_directory. Use for general questions when you don't know the kind, or when you want hits across ADRs, glossary, and prose at once. Example queries: 'how does session lifetime work', 'what is the chunking strategy for markdown'."
     )]
     async fn query(&self, Parameters(params): Parameters<QueryParams>) -> String {
+        let project = match self.resolve(&params.working_directory).await {
+            Ok(project) => project,
+            Err(message) => return format_error(&message),
+        };
         let top_k = params
             .top_k
-            .unwrap_or(self.state.config.retrieval.top_k_default);
-        match self.state.query.run(&params.query, top_k, None).await {
+            .unwrap_or(project.config.retrieval.top_k_default);
+        match project.query.run(&params.query, top_k, None).await {
             Ok(records) => {
                 let chunks: Vec<ToolChunk> = records.into_iter().map(ToolChunk::from).collect();
                 json_or_error(&chunks)
@@ -418,14 +409,17 @@ impl SchemaServer {
 
     /// Semantic search restricted to ADRs (kind = adr-madr).
     #[tool(
-        description = "Semantic search restricted to architectural decisions (ADRs). Use to retrieve a decision and its rationale. Returns the ADR body plus surrounding context. Example queries: 'why did we pick LanceDB', 'what is our session lifetime policy'."
+        description = "Semantic search restricted to architectural decisions (ADRs) within the project resolved from working_directory. Use to retrieve a decision and its rationale. Returns the ADR body plus surrounding context. Example queries: 'why did we pick LanceDB', 'what is our session lifetime policy'."
     )]
     async fn find_decisions(&self, Parameters(params): Parameters<FindDecisionsParams>) -> String {
+        let project = match self.resolve(&params.working_directory).await {
+            Ok(project) => project,
+            Err(message) => return format_error(&message),
+        };
         let top_k = params
             .top_k
-            .unwrap_or(self.state.config.retrieval.top_k_default);
-        match self
-            .state
+            .unwrap_or(project.config.retrieval.top_k_default);
+        match project
             .query
             .run(&params.query, top_k, Some("AdrMadr"))
             .await
@@ -440,17 +434,20 @@ impl SchemaServer {
 
     /// Term lookup restricted to glossary entries.
     #[tool(
-        description = "Look up a term in the project glossary. Match is semantic, so synonyms and related phrases surface — you don't need the exact word the glossary uses. Examples: 'RBAC' → 'role-based access control'. 'JWT' → 'JSON Web Token'."
+        description = "Look up a term in the project glossary (project resolved from working_directory). Match is semantic, so synonyms and related phrases surface — you don't need the exact word the glossary uses. Examples: 'RBAC' → 'role-based access control'. 'JWT' → 'JSON Web Token'."
     )]
     async fn glossary_lookup(
         &self,
         Parameters(params): Parameters<GlossaryLookupParams>,
     ) -> String {
+        let project = match self.resolve(&params.working_directory).await {
+            Ok(project) => project,
+            Err(message) => return format_error(&message),
+        };
         let top_k = params
             .top_k
-            .unwrap_or(self.state.config.retrieval.top_k_default);
-        match self
-            .state
+            .unwrap_or(project.config.retrieval.top_k_default);
+        match project
             .query
             .run(&params.term, top_k, Some("Glossary"))
             .await
@@ -465,17 +462,20 @@ impl SchemaServer {
 
     /// Cross-reference: artifact id → definition + referencing chunks.
     #[tool(
-        description = "Given an artifact id (e.g. 'ADR-0055'), return its defining chunks PLUS every chunk elsewhere in the corpus that references it. Useful for impact analysis: 'what depends on this decision'. Example: artifact_id='ADR-0055' → returns the ADR's own body and every other chunk that mentions ADR-0055 inline."
+        description = "Given an artifact id (e.g. 'ADR-0055') in the project resolved from working_directory, return its defining chunks PLUS every chunk elsewhere in the corpus that references it. Useful for impact analysis: 'what depends on this decision'. Example: artifact_id='ADR-0055' → returns the ADR's own body and every other chunk that mentions ADR-0055 inline."
     )]
     async fn cross_reference(
         &self,
         Parameters(params): Parameters<CrossReferenceParams>,
     ) -> String {
+        let project = match self.resolve(&params.working_directory).await {
+            Ok(project) => project,
+            Err(message) => return format_error(&message),
+        };
         let def_limit = params.definition_limit.unwrap_or(16);
         let ref_limit = params.reference_limit.unwrap_or(32);
 
-        match self
-            .state
+        match project
             .query
             .cross_reference(&params.artifact_id, def_limit, ref_limit)
             .await
@@ -494,13 +494,17 @@ impl SchemaServer {
 
     /// Debug — list every distinct source path indexed for this project.
     #[tool(
-        description = "Debug — list every source path currently in the project's index. Useful for verifying that schema.toml corpus paths expanded into the files you expected. No arguments."
+        description = "Debug — list every source path currently in the index for the project resolved from working_directory. Useful for verifying that schema.toml corpus paths expanded into the files you expected."
     )]
-    async fn list_corpus(&self, _params: Parameters<ListCorpusParams>) -> String {
-        match self.state.query.list_source_paths().await {
+    async fn list_corpus(&self, Parameters(params): Parameters<ListCorpusParams>) -> String {
+        let project = match self.resolve(&params.working_directory).await {
+            Ok(project) => project,
+            Err(message) => return format_error(&message),
+        };
+        match project.query.list_source_paths().await {
             Ok(paths) => {
                 let listing = CorpusListing {
-                    project: self.state.config.project.name.clone(),
+                    project: project.config.project.name.clone(),
                     source_paths: paths,
                 };
                 json_or_error(&listing)
@@ -510,14 +514,22 @@ impl SchemaServer {
     }
 
     /// DESTRUCTIVE — wipe every chunk + the manifest for this project.
+    /// Scoped strictly to the project resolved from `working_directory`;
+    /// other projects' indexes are untouched (ADR-0008 isolation,
+    /// ADR-0027 §"Decision drivers").
     #[tool(
-        description = "DESTRUCTIVE — wipe every chunk and reset the manifest for this project. Ask the operator to confirm before calling. Use after a chunking strategy change or model swap when a full re-index is wanted. Next `schema serve` rebuilds from scratch (~30-60s for a typical corpus)."
+        description = "DESTRUCTIVE — wipe every chunk and reset the manifest for the project resolved from working_directory. Ask the operator to confirm before calling. Use after a chunking strategy change or model swap when a full re-index is wanted. Next tool call against this project rebuilds from scratch. Other projects' indexes are untouched."
     )]
-    async fn reset_index(&self, _params: Parameters<ResetIndexParams>) -> String {
-        match self.state.cleanup.reset_index().await {
+    async fn reset_index(&self, Parameters(params): Parameters<ResetIndexParams>) -> String {
+        let project = match self.resolve(&params.working_directory).await {
+            Ok(project) => project,
+            Err(message) => return format_error(&message),
+        };
+        match project.cleanup.reset_index().await {
             Ok(()) => json_or_error(&serde_json::json!({
                 "status": "ok",
                 "action": "reset_index",
+                "project_id": project.identity.id.to_string(),
             })),
             Err(e) => format_error(&format!("{e}")),
         }
@@ -526,13 +538,18 @@ impl SchemaServer {
     /// DESTRUCTIVE — drop chunks for one source path + drop it from the
     /// manifest.
     #[tool(
-        description = "DESTRUCTIVE — drop every chunk for one source path from the index. The file on disk is NOT deleted; only its chunks vanish from the index. Use when a doc has gone stale or noisy. Example: path='docs/decisions/0042-deprecated.md' removes only that file's chunks."
+        description = "DESTRUCTIVE — drop every chunk for one source path from the index of the project resolved from working_directory. The file on disk is NOT deleted; only its chunks vanish from the index. Use when a doc has gone stale or noisy. Example: path='docs/decisions/0042-deprecated.md' removes only that file's chunks."
     )]
     async fn forget_source(&self, Parameters(params): Parameters<ForgetSourceParams>) -> String {
-        match self.state.cleanup.forget_source(&params.path).await {
+        let project = match self.resolve(&params.working_directory).await {
+            Ok(project) => project,
+            Err(message) => return format_error(&message),
+        };
+        match project.cleanup.forget_source(&params.path).await {
             Ok(()) => json_or_error(&serde_json::json!({
                 "status": "ok",
                 "action": "forget_source",
+                "project_id": project.identity.id.to_string(),
                 "path": params.path,
             })),
             Err(e) => format_error(&format!("{e}")),
@@ -543,18 +560,22 @@ impl SchemaServer {
     ///
     /// Description must follow ADR-0016 style: action verb opening +
     /// concrete example + differentiation hint + availability note.
-    /// Tool count is 8-or-9: when no `*_API_KEY` is set, the call
+    /// Tool count is 9-or-10: when no `*_API_KEY` is set, the call
     /// returns an error envelope; `workspace_context.llm.active` is
     /// the canonical signal the calling LLM checks before invoking.
     #[tool(
-        description = "Answer a natural-language question over the indexed corpus by retrieving the top semantically-similar chunks and composing a cited answer through a configured cloud LLM (Anthropic Claude or OpenAI GPT). Returns {answer, citations[], model, usage}; each citation carries source_path, line range, and optional artifact_id (e.g. \"ADR-0019\"). Example call: synthesize {\"query\": \"How does ADR-0019 handle session liveness?\", \"top_k\": 6} → narrative answer plus 2-3 citations into the actual ADR file. Differs from `query`, `find_decisions`, `glossary_lookup` (which return raw chunks for the **calling** LLM to read) — use `synthesize` when the caller wants a ready answer, not chunks; use the retrieval tools when the caller wants to read the source material directly. Requires a provider API key (ANTHROPIC_API_KEY or OPENAI_API_KEY) at server startup; check `workspace_context.llm.active = true` before calling. When disabled, this tool returns an error envelope explaining how to enable it. One outbound HTTPS call to the configured provider per invocation."
+        description = "Answer a natural-language question over the indexed corpus of the project resolved from working_directory by retrieving the top semantically-similar chunks and composing a cited answer through a configured cloud LLM (Anthropic Claude or OpenAI GPT). Returns {answer, citations[], model, usage}; each citation carries source_path, line range, and optional artifact_id (e.g. \"ADR-0019\"). Differs from `query`, `find_decisions`, `glossary_lookup` (which return raw chunks for the **calling** LLM to read) — use `synthesize` when the caller wants a ready answer, not chunks; use the retrieval tools when the caller wants to read the source material directly. Requires a provider API key (ANTHROPIC_API_KEY or OPENAI_API_KEY) at daemon startup; check `workspace_context.llm.active = true` before calling. When disabled, this tool returns an error envelope explaining how to enable it."
     )]
     async fn synthesize(&self, Parameters(params): Parameters<SynthesizeParams>) -> String {
-        let Some(synth) = self.state.synthesize.as_ref() else {
+        let project = match self.resolve(&params.working_directory).await {
+            Ok(project) => project,
+            Err(message) => return format_error(&message),
+        };
+        let Some(synth) = project.synthesize.as_ref() else {
             return format_error(
                 "synthesize is disabled: set ANTHROPIC_API_KEY or OPENAI_API_KEY \
                  (or [llm] provider = \"anthropic\" / \"openai\" with the \
-                 matching key) and restart schema serve.",
+                 matching key) and restart the schema daemon.",
             );
         };
         let top_k = params.top_k.unwrap_or(8).clamp(1, 16);
@@ -563,6 +584,73 @@ impl SchemaServer {
             Err(e) => format_error(&format!("{e}")),
         }
     }
+}
+
+impl SchemaServer {
+    /// Resolve `working_directory` to a wired [`ProjectInstance`],
+    /// returning a string the handler can pipe straight into
+    /// [`format_error`] when resolution fails.
+    async fn resolve(&self, working_directory: &str) -> Result<Arc<ProjectInstance>, String> {
+        let path = Path::new(working_directory);
+        self.daemon
+            .resolve_or_wire(path)
+            .await
+            .map_err(|e| format!("{e:#}"))
+    }
+}
+
+fn build_workspace_context(project: &ProjectInstance) -> WorkspaceContext {
+    WorkspaceContext {
+        project: build_project_context(project),
+        corpus: build_corpus_entries(project),
+        embedding: build_embedding_context(project),
+        llm: build_llm_context(project),
+    }
+}
+
+fn build_project_context(project: &ProjectInstance) -> ProjectContext {
+    ProjectContext {
+        name: project.config.project.name.clone(),
+        id: project.identity.id.to_string(),
+        version: project.config.project.version.clone(),
+        root: project.identity.root.display().to_string(),
+        cache_dir: project.identity.cache_dir.display().to_string(),
+    }
+}
+
+fn build_corpus_entries(project: &ProjectInstance) -> Vec<CorpusEntry> {
+    project
+        .config
+        .corpus
+        .iter()
+        .map(|c| CorpusEntry {
+            path: c.path.display().to_string(),
+            kind: format!("{:?}", c.kind),
+        })
+        .collect()
+}
+
+fn build_embedding_context(project: &ProjectInstance) -> EmbeddingContext {
+    use crate::adapters::fastembed_embedder::BGE_M3_DIMENSIONS;
+    EmbeddingContext {
+        model: project.config.embedding.model.clone(),
+        dims: BGE_M3_DIMENSIONS,
+    }
+}
+
+fn build_llm_context(project: &ProjectInstance) -> LlmContext {
+    project.synthesize.as_ref().map_or(
+        LlmContext {
+            active: false,
+            provider: None,
+            model: None,
+        },
+        |synth| LlmContext {
+            active: true,
+            provider: Some(synth.provider_name().to_string()),
+            model: Some(synth.model()),
+        },
+    )
 }
 
 /// Serialise any `Serialize` value to JSON; on failure return a JSON-encoded
@@ -580,12 +668,13 @@ fn format_error(message: &str) -> String {
 }
 
 impl SchemaServer {
-    /// Construct a server with fully-resolved state.
+    /// Construct a server backed by the supplied [`Daemon`]. The daemon
+    /// owns the shared `Embedder` + optional shared `LlmProvider` and
+    /// the lazy `Map<ProjectId, Arc<ProjectInstance>>`. Every tool
+    /// handler dispatches per-call via `daemon.resolve_or_wire`.
     #[must_use]
-    pub fn with_state(state: ServerState) -> Self {
-        Self {
-            state: Arc::new(state),
-        }
+    pub const fn with_daemon(daemon: Arc<Daemon>) -> Self {
+        Self { daemon }
     }
 }
 
@@ -652,105 +741,4 @@ pub fn build_router(
             header::AUTHORIZATION,
         )))
         .layer(TraceLayer::new_for_http())
-}
-
-/// One project's mount inside the shared-daemon router (ADR-0026).
-///
-/// Each [`Mount`] becomes a `nest_service("/mcp/<project_id>", ...)`
-/// gated by a single-token [`BearerValidator`]. The token is the
-/// project's own — built by [`crate::app::daemon::Daemon::wire`] at
-/// startup and rotated per daemon restart per ADR-0021.
-#[derive(Clone)]
-pub struct Mount {
-    /// Stable project identifier — becomes the URL path segment.
-    pub project_id: String,
-    /// The project's bearer token. Single-token validator at this
-    /// mount accepts only this string; mismatched tokens (other
-    /// projects' or unknown) hit 401, even when the URL path is
-    /// well-formed. This is the ADR-0026 §"Decision drivers"
-    /// "provable per-project isolation at query time" contract.
-    pub token: String,
-    /// The per-project `SchemaServer` whose handlers wrap that
-    /// project's `Query` / `Cleanup` / `Synthesize` use cases.
-    pub server: SchemaServer,
-}
-
-impl fmt::Debug for Mount {
-    /// Manual `Debug` impl — `SchemaServer` does not implement
-    /// `Debug` (its rmcp-derived inner type forbids derive), and the
-    /// bearer `token` is sensitive (per ADR-0021 it must never reach
-    /// structured logs). Surface only the `project_id`.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Mount")
-            .field("project_id", &self.project_id)
-            .finish_non_exhaustive()
-    }
-}
-
-/// Compose the shared-daemon `axum::Router` (ADR-0026 slice 4).
-///
-/// Layout:
-/// - `GET /health` — unauthenticated liveness probe (one global).
-/// - `POST /mcp/<project_id>` — one `nest_service` per project,
-///   each gated by a single-token [`BearerValidator`] tied to
-///   that project's bearer. The token validator's exclusivity
-///   provides the cross-project isolation: a request bearing
-///   project A's token at `/mcp/<project_b_id>` returns 401 from
-///   the validator, never reaching project B's `SchemaServer`.
-///
-/// Cross-cutting layers (applied at the root, so trace spans cover
-/// `/health` too):
-/// - [`SetSensitiveRequestHeadersLayer`] keeps `Authorization` out
-///   of the trace logs.
-/// - [`TraceLayer::new_for_http`] emits one `tracing` span per
-///   request.
-///
-/// `cancellation_token` is shared across every mount so a single
-/// SIGTERM drains all in-flight sessions in parallel.
-///
-/// An empty `mounts` list produces a router with only `/health`.
-/// Useful as a degenerate-case fixture in tests and as the daemon
-/// startup state before any project is registered.
-pub fn build_multi_tenant_router(
-    mounts: Vec<Mount>,
-    cancellation_token: &CancellationToken,
-) -> Router {
-    info!(
-        project_count = mounts.len(),
-        "building multi-tenant HTTP MCP router (ADR-0026)"
-    );
-
-    let mut router = Router::new();
-    for mount in mounts {
-        router = router.merge(per_project_router(mount, cancellation_token.clone()));
-    }
-
-    router
-        .route("/health", get(health_handler))
-        .layer(SetSensitiveRequestHeadersLayer::new(iter::once(
-            header::AUTHORIZATION,
-        )))
-        .layer(TraceLayer::new_for_http())
-}
-
-fn per_project_router(mount: Mount, cancellation_token: CancellationToken) -> Router {
-    let config = StreamableHttpServerConfig::default()
-        .with_cancellation_token(cancellation_token)
-        .with_sse_keep_alive(Some(Duration::from_secs(15)))
-        .with_sse_retry(Some(Duration::from_secs(3)))
-        .with_stateful_mode(true)
-        .with_allowed_hosts(["localhost", "127.0.0.1", "::1"]);
-    let server = mount.server;
-    let mcp_service = StreamableHttpService::new(
-        move || Ok(server.clone()),
-        Arc::new(LocalSessionManager::default()),
-        config,
-    );
-
-    let path = format!("/mcp/{}", mount.project_id);
-    Router::new()
-        .nest_service(&path, mcp_service)
-        .layer(ValidateRequestHeaderLayer::custom(BearerValidator::new(
-            mount.token,
-        )))
 }

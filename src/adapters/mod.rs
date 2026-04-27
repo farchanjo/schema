@@ -17,6 +17,5 @@ pub mod mcp_server;
 pub mod metadata_store;
 pub mod openai_provider;
 pub mod project_identity;
-pub mod registry_toml;
 pub mod sqlite_vec_store;
 pub mod toml_config;
