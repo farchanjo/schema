@@ -32,11 +32,10 @@ use uuid::Uuid;
 
 use schema::adapters::anthropic_provider::AnthropicProvider;
 use schema::adapters::endpoint_toml::Endpoint;
-use schema::adapters::fastembed_embedder::FastembedEmbedder;
 use schema::adapters::mcp_server::{SchemaServer, build_router};
 use schema::adapters::metadata_store::TomlMetadataStore;
 use schema::adapters::openai_provider::OpenAiProvider;
-use schema::adapters::project_identity::ProjectIdentity;
+use schema::adapters::project_identity::{ProjectIdentity, cache_root};
 use schema::adapters::secrets_toml::FileSecretStore;
 use schema::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_dir};
 use schema::adapters::toml_config::SchemaConfig;
@@ -51,7 +50,9 @@ use schema::cli::install::{
 };
 use schema::cli::mcp_shim;
 use schema::cli::secrets as secrets_cli;
-use schema::ports::{Embedder, LlmProvider, MetadataStore, Persistence, ProviderId, SecretStore};
+use schema::ports::{LlmProvider, MetadataStore, Persistence, ProviderId, SecretStore};
+use schema_core::embedder::Embedder;
+use schema_core::fastembed_embedder::FastembedEmbedder;
 
 /// Build the top-level CLI definition using the clap builder API.
 ///
@@ -543,7 +544,9 @@ fn resolve_auto(
 
 async fn run_serve(config: PathBuf) -> Result<()> {
     let (cfg, identity) = resolve_serve_context(&config)?;
-    let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3()?));
+    let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3(
+        cache_root()?.join("models"),
+    )?));
     let llm_provider = resolve_llm_provider(&cfg)?;
     let project = ProjectInstance::wire(cfg, identity, &embedder, llm_provider.clone()).await?;
     let initial = project.sync.run().await?;
@@ -603,7 +606,9 @@ async fn serve_http(server: SchemaServer, endpoint_path: PathBuf) -> Result<()> 
 /// the in-flight sessions are drained and every `endpoint.toml` is
 /// removed.
 async fn run_daemon() -> Result<()> {
-    let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3()?));
+    let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3(
+        cache_root()?.join("models"),
+    )?));
     let llm_provider = resolve_llm_provider_for_daemon()?;
     let daemon = Arc::new(Daemon::new(embedder, llm_provider));
     tracing::info!("daemon: empty (lazy resolve via working_directory per ADR-0027)");

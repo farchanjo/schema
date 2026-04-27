@@ -10,7 +10,6 @@
 pub mod anthropic_provider;
 pub mod auth;
 pub mod endpoint_toml;
-pub mod fastembed_embedder;
 pub mod filesystem;
 pub mod markdown_chunker;
 pub mod mcp_server;

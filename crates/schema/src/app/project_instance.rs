@@ -52,7 +52,8 @@ use crate::app::delta_sync::{DeltaSync, corpus_paths_from_config};
 use crate::app::query::Query;
 use crate::app::synthesize::Synthesize;
 use crate::app::watcher_consumer::run_watcher_consumer;
-use crate::ports::{Chunker, Embedder, LlmProvider, MetadataStore, Persistence, Walker, Watcher};
+use crate::ports::{Chunker, LlmProvider, MetadataStore, Persistence, Walker, Watcher};
+use schema_core::embedder::Embedder;
 
 /// Watcher debounce window — matches the value `main::WATCHER_DEBOUNCE`
 /// used by the single-project ADR-0019 path so both deployment shapes

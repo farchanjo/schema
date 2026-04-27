@@ -24,7 +24,8 @@ use tracing::{info, warn};
 use crate::adapters::metadata_store::{file_content_hash, file_mtime};
 use crate::adapters::toml_config::SchemaConfig;
 use crate::domain::{ChangeOutcome, Chunk, CorpusKind, DiscoveredFile, FileMeta, Metadata};
-use crate::ports::{Chunker, Embedder, MetadataStore, Persistence, Walker};
+use crate::ports::{Chunker, MetadataStore, Persistence, Walker};
+use schema_core::embedder::Embedder;
 
 /// Summary of what a sync pass did.
 #[derive(Debug, Default, Clone)]
@@ -343,10 +344,9 @@ mod tests {
 
     use super::*;
     use crate::domain::ChunkRecord;
-    use crate::ports::{
-        ChunkerError, EmbedError, MetadataStoreError, PersistenceError, WalkerError,
-    };
+    use crate::ports::{ChunkerError, MetadataStoreError, PersistenceError, WalkerError};
     use async_trait::async_trait;
+    use schema_core::embedder::EmbedError;
     use std::fs::File;
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;

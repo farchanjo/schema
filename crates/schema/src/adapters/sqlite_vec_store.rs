@@ -35,9 +35,9 @@ use tokio::sync::Mutex;
 use tokio::task;
 use tracing::info;
 
-use crate::adapters::fastembed_embedder::BGE_M3_DIMENSIONS;
 use crate::domain::{Chunk, ChunkRecord};
 use crate::ports::{Persistence, PersistenceError};
+use schema_core::fastembed_embedder::BGE_M3_DIMENSIONS;
 
 /// One-shot guard: register `sqlite_vec::sqlite3_vec_init` exactly once for
 /// the lifetime of the process. `SQLite`'s auto-extension list is global;

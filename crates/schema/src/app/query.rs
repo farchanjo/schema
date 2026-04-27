@@ -13,7 +13,8 @@ use anyhow::Result;
 use tokio::sync::Mutex;
 
 use crate::domain::ChunkRecord;
-use crate::ports::{Embedder, Persistence};
+use crate::ports::Persistence;
+use schema_core::embedder::Embedder;
 
 /// Read-side service. Cheap to clone; holds `Arc`s.
 ///

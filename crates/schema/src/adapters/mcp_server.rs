@@ -725,7 +725,7 @@ fn build_corpus_entries(project: &ProjectInstance) -> Vec<CorpusEntry> {
 }
 
 fn build_embedding_context(project: &ProjectInstance) -> EmbeddingContext {
-    use crate::adapters::fastembed_embedder::BGE_M3_DIMENSIONS;
+    use schema_core::fastembed_embedder::BGE_M3_DIMENSIONS;
     EmbeddingContext {
         model: project.config.embedding.model.clone(),
         dims: BGE_M3_DIMENSIONS,

@@ -22,9 +22,8 @@ use tokio::time::timeout;
 use std::fmt::Write as _;
 
 use crate::domain::ChunkRecord;
-use crate::ports::{
-    Embedder, LlmError, LlmProvider, Persistence, SynthesisRequest, SynthesisResponse,
-};
+use crate::ports::{LlmError, LlmProvider, Persistence, SynthesisRequest, SynthesisResponse};
+use schema_core::embedder::Embedder;
 
 /// Hard cap on the user prompt context block (system prompt excluded).
 /// 32 KiB matches the `[retrieval] chunk_size_max = 8 KiB × top_k 16`

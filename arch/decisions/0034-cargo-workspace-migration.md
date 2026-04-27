@@ -422,6 +422,31 @@ path = "src/main.rs"
 
 ## Evidence and amendments
 
+- **2026-04-27 — commit 2 landed.** New library crate
+  `crates/schema-core/` carries the shared kernel:
+  `embedder::{Embedder, EmbedError, EMBEDDER_QUERY_PREFIX,
+  EMBEDDER_PASSAGE_PREFIX}` + `fastembed_embedder::{FastembedEmbedder,
+  BGE_M3_DIMENSIONS, FastembedEmbedderError}`. The fastembed adapter
+  is bounded-context-agnostic — `new_bge_m3()` now takes a
+  `cache_dir: PathBuf` parameter so each consumer (schema today,
+  recall later) chooses where to cache the ONNX weights. The crate
+  refuses `pub use` flattening at the root per ADR-0012's `pub_use`
+  deny; consumers reach via `schema_core::embedder::Embedder` and
+  `schema_core::fastembed_embedder::FastembedEmbedder`. The
+  `Embedder` block in `crates/schema/src/ports.rs` was deleted (a
+  doc-comment stub points at schema-core); every `use
+  crate::ports::Embedder` use site moved to
+  `use schema_core::embedder::Embedder`. `crates/schema/Cargo.toml`
+  drops the direct `fastembed = "5.13"` dep and adds
+  `schema-core = { path = "../schema-core" }`. Validation gate
+  green: 139 tests (one removed: the `cache_dir_under_schema_root`
+  test that relied on a now-deleted `bge_m3_cache_dir` helper —
+  the constructor takes the cache_dir explicitly so the helper
+  is no longer needed). `cargo tree -p schema-core -e all` would
+  show zero dependency on `crates/schema/` (asserted by
+  construction — schema-core declares only `async-trait`,
+  `fastembed`, `thiserror`, `tokio`, `tracing`).
+
 - **2026-04-27 — commit 1 landed.** Root `Cargo.toml`
   converted to `[workspace]` + `[workspace.package]` + per-
   layer `[workspace.lints.{clippy,rust}]` blocks (the strict

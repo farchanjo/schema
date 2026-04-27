@@ -58,7 +58,8 @@ use tokio::sync::{Mutex, RwLock};
 use crate::adapters::project_identity::{ProjectId, ProjectIdentity};
 use crate::adapters::toml_config::SchemaConfig;
 use crate::app::project_instance::{ProjectInstance, spawn_project_watcher};
-use crate::ports::{Embedder, LlmProvider};
+use crate::ports::LlmProvider;
+use schema_core::embedder::Embedder;
 
 /// Per-workstation daemon. See module docs.
 pub struct Daemon {
@@ -247,7 +248,7 @@ mod tests {
     use tokio::sync::Mutex;
 
     use super::Daemon;
-    use crate::ports::{EmbedError, Embedder};
+    use schema_core::embedder::{EmbedError, Embedder};
 
     fn empty_embedder() -> Arc<Mutex<dyn Embedder>> {
         Arc::new(Mutex::new(MuteEmbedder))

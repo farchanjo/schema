@@ -16,6 +16,13 @@ name = "schema"
 path = "src/main.rs"
 
 [dependencies]
+# Shared kernel between schema and recall (ADR-0034).
+# Re-exports the Embedder port, FastembedEmbedder adapter, and BGE-M3
+# prefix constants. Schema imports these from `schema_core::` directly;
+# the previous `crate::ports::{Embedder, ...}` and
+# `crate::adapters::fastembed_embedder::{FastembedEmbedder, BGE_M3_DIMENSIONS}`
+# paths are gone.
+schema-core = { path = "../schema-core" }
 # MCP — Model Context Protocol Rust SDK
 # Features required (post-ADR-0019):
 #   server                            — server-side handler infrastructure
@@ -69,8 +76,8 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
 
-# Embeddings (bge-m3 via ort/ONNX Runtime)
-fastembed = "5.13"
+# Embeddings (bge-m3 via ort/ONNX Runtime) — direct dependency removed
+# in ADR-0034 step 2. Schema now consumes the embedder via schema-core.
 
 # Vector store (sqlite-vec — embedded, file-backed; ADR-0011).
 # `bundled` vendors SQLite so we do not depend on a system install.

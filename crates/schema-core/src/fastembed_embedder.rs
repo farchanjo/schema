@@ -1,14 +1,14 @@
 //! `bge-m3` embedder via fastembed 5.x (uses ONNX Runtime under the hood).
 //!
 //! BGE-M3 produces 1024-dimensional dense embeddings. fastembed downloads the
-//! ONNX model from Hugging Face Hub on first use and caches it locally; we
-//! point its cache to `~/.cache/schema/models/` so multiple projects share the
-//! same downloaded weights.
+//! ONNX model from Hugging Face Hub on first use and caches it in a directory
+//! the caller supplies; this crate is bounded-context-agnostic, so each
+//! consumer (schema, recall) chooses where to cache.
 //!
-//! Per ADR-0013 this adapter implements the [`crate::ports::Embedder`] async
-//! trait. Because `fastembed::TextEmbedding::embed` is synchronous and CPU-
-//! bound, the implementation hops to `tokio::task::spawn_blocking` so the
-//! Tokio runtime remains responsive while ONNX is computing.
+//! Per ADR-0013 + ADR-0034 this adapter implements the [`Embedder`] async
+//! trait. Because `fastembed::TextEmbedding::embed` is synchronous and
+//! CPU-bound, the implementation hops to `tokio::task::spawn_blocking` so
+//! the Tokio runtime remains responsive while ONNX is computing.
 
 use std::fmt;
 use std::fs;
@@ -21,22 +21,19 @@ use thiserror::Error;
 use tokio::task;
 use tracing::{debug, info};
 
-use crate::adapters::project_identity::cache_root;
-use crate::ports::{EMBEDDER_PASSAGE_PREFIX, EMBEDDER_QUERY_PREFIX, EmbedError, Embedder};
+use crate::embedder::{EMBEDDER_PASSAGE_PREFIX, EMBEDDER_QUERY_PREFIX, EmbedError, Embedder};
 
 /// Output dimension of BGE-M3.
 pub const BGE_M3_DIMENSIONS: usize = 1024;
 
 #[derive(Debug, Error)]
-pub enum EmbedderError {
+pub enum FastembedEmbedderError {
     #[error("fastembed initialisation failed: {0}")]
     Init(String),
     #[error("embedding failed: {0}")]
     Embed(String),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
-    #[error("anyhow: {0}")]
-    Other(#[from] anyhow::Error),
 }
 
 /// Embedder wrapping a fastembed `TextEmbedding` instance.
@@ -64,14 +61,23 @@ impl fmt::Debug for FastembedEmbedder {
 }
 
 impl FastembedEmbedder {
-    /// Initialise the BGE-M3 embedder. Caches the model under
-    /// `~/.cache/schema/models/`.
+    /// Initialise the BGE-M3 embedder.
+    ///
+    /// `cache_dir` is where fastembed downloads and stores the ONNX model
+    /// weights. The caller is responsible for choosing a stable path
+    /// (typically a subdirectory of the consumer's cache root):
+    ///
+    /// - **schema** uses `~/Library/Caches/schema/models/` on macOS.
+    /// - **recall** uses `~/Library/Caches/recall/models/` on macOS
+    ///   (ADR-0033 + ADR-0035 path resolution).
+    ///
+    /// The directory is created if it does not exist.
     ///
     /// # Errors
-    /// Returns an error if the cache directory cannot be created or fastembed
-    /// fails to load the BGE-M3 ONNX model.
-    pub fn new_bge_m3() -> Result<Self, EmbedderError> {
-        let cache_dir = bge_m3_cache_dir()?;
+    /// Returns [`FastembedEmbedderError::Io`] if the cache directory
+    /// cannot be created and [`FastembedEmbedderError::Init`] if
+    /// fastembed fails to load the BGE-M3 ONNX model.
+    pub fn new_bge_m3(cache_dir: PathBuf) -> Result<Self, FastembedEmbedderError> {
         fs::create_dir_all(&cache_dir)?;
 
         info!(
@@ -83,8 +89,8 @@ impl FastembedEmbedder {
             .with_cache_dir(cache_dir)
             .with_show_download_progress(false);
 
-        let model =
-            TextEmbedding::try_new(opts).map_err(|e| EmbedderError::Init(format!("{e}")))?;
+        let model = TextEmbedding::try_new(opts)
+            .map_err(|e| FastembedEmbedderError::Init(format!("{e}")))?;
 
         debug!("bge-m3 embedder ready");
         Ok(Self { model: Some(model) })
@@ -153,30 +159,4 @@ impl Embedder for FastembedEmbedder {
         };
         self.embed_blocking(prepared).await
     }
-}
-
-/// `~/.cache/schema/models/`.
-fn bge_m3_cache_dir() -> Result<PathBuf, EmbedderError> {
-    let root = cache_root()?;
-    Ok(root.join("models"))
-}
-
-#[cfg(test)]
-mod tests {
-    #![allow(
-        clippy::unwrap_used,
-        reason = "test fixtures may panic if the env is broken"
-    )]
-    use super::*;
-
-    #[test]
-    fn cache_dir_under_schema_root() {
-        let dir = bge_m3_cache_dir().unwrap();
-        assert!(dir.ends_with("schema/models"));
-    }
-
-    // NOTE: the live embedder test is intentionally omitted here. Constructing
-    // an Embedder downloads ~2 GB on first run and is unsuitable for `cargo test`.
-    // Integration tests that exercise the embedder live in `tests/integration.rs`
-    // and are gated behind the `schema-online` env flag (commit 11 wires it).
 }

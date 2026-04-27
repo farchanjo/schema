@@ -24,8 +24,9 @@ mod tests {
     use schema::adapters::sqlite_vec_store::{
         RECIPE_BGE_M3_QUERY_PASSAGE, RECIPE_RAW, SqliteVecStore,
     };
-    use schema::ports::{
-        EMBEDDER_PASSAGE_PREFIX, EMBEDDER_QUERY_PREFIX, EmbedError, Embedder, Persistence,
+    use schema::ports::Persistence;
+    use schema_core::embedder::{
+        EMBEDDER_PASSAGE_PREFIX, EMBEDDER_QUERY_PREFIX, EmbedError, Embedder,
     };
     use std::sync::Mutex as StdMutex;
     use tempfile::TempDir;

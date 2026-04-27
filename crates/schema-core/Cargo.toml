@@ -1,0 +1,22 @@
+[package]
+name = "schema-core"
+description = "Shared kernel between the schema and recall bounded contexts: Embedder port, fastembed adapter, BGE-M3 prefix policy, generic infrastructure (ADR-0034)."
+keywords = ["mcp", "rag", "embeddings", "fastembed", "bge-m3"]
+categories = ["development-tools", "text-processing"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+async-trait = "0.1.89"
+fastembed = "5.13"
+thiserror = "2"
+tokio = { version = "1.52", features = ["rt", "rt-multi-thread", "sync"] }
+tracing = "0.1"
+
+[lints]
+workspace = true
