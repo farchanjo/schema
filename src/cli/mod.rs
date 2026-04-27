@@ -6,3 +6,4 @@
 //! easy to read.
 
 pub mod install;
+pub mod project;
