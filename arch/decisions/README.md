@@ -49,3 +49,5 @@ pointing at the CI check that proves the decision is still in effect.
 | 0025 | [LLM `synthesize` tool + `LlmProvider` port (Anthropic / OpenAI)](./0025-llm-synthesize-tool-and-provider-port.md) | accepted | 2026-04-26 |
 | 0026 | [One shared daemon for all projects, with strict per-project isolation](./0026-shared-multi-project-daemon-with-strict-isolation.md) | partially superseded by 0027 (routing/membership specifics; drivers preserved) | 2026-04-26 |
 | 0027 | [LLM-driven project discovery: directory-as-source-of-truth](./0027-llm-driven-project-discovery.md) | accepted (live) — cutover 2026-04-27 | 2026-04-26 |
+| 0028 | [Kind-aware retrieval via `sqlite-vec` partition key + per-project score floor](./0028-kind-aware-retrieval-and-score-floor.md) | accepted | 2026-04-27 |
+| 0029 | [bge-m3 query/passage prefix policy with gradual per-project rollout](./0029-bge-m3-asymmetric-prefix-policy.md) | accepted | 2026-04-27 |
