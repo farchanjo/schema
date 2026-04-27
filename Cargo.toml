@@ -1,123 +1,21 @@
-[package]
-name = "schema"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members  = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version      = "0.1.0"
+edition      = "2024"
 rust-version = "1.95"
-license = "Apache-2.0"
-description = "MCP server for indexing project specs, ADRs, contracts, and glossaries via local RAG (bge-m3 + sqlite-vec)"
-authors = ["Fabricio Archanjo <farchanjo@gmail.com>"]
-repository = "https://github.com/farchanjo/schema"
-readme = "README.md"
-keywords = ["mcp", "rag", "embeddings", "adr", "specs"]
-categories = ["development-tools", "command-line-utilities"]
-
-[[bin]]
-name = "schema"
-path = "src/main.rs"
-
-[dependencies]
-# MCP — Model Context Protocol Rust SDK
-# Features required (post-ADR-0019):
-#   server                            — server-side handler infrastructure
-#   macros                            — #[tool] and #[tool_router] attribute macros
-#   transport-streamable-http-server  — Streamable HTTP server transport
-# `transport-io` (stdio) is **dropped** per ADR-0019 — the binary no longer
-# speaks stdio; one HTTP server per project (ADR-0020) replaces N stdio
-# subprocesses.
-rmcp = { version = "1.5", features = [
-    "server",
-    "macros",
-    "transport-streamable-http-server",
-] }
-
-# Async runtime
-# `test-util` powers `tokio::test(start_paused = true)` and
-# `tokio::time::advance(...)` in the watcher consumer's debounce tests.
-tokio = { version = "1.52", features = ["full", "test-util"] }
-tokio-util = { version = "0.7", features = ["rt"] }
-futures = "0.3"
-
-# HTTP MCP transport stack (ADR-0019, ADR-0021).
-# axum 0.8 + tower 0.5 + tower-http 0.6 are the upstream-paired versions
-# (axum 0.8.x's own Cargo.toml lists `tower-http = "0.6.8"`).
-axum       = "0.8"
-tower      = "0.5"
-tower-http = { version = "0.6", features = [
-    "validate-request",   # ValidateRequestHeaderLayer::custom for bearer auth
-    "trace",              # TraceLayer for request spans
-    "sensitive-headers",  # SetSensitiveRequestHeadersLayer to redact Authorization
-] }
-http             = "1"
-http-body-util   = "0.1"
-bytes            = "1"
-uuid             = { version = "1", features = ["v4"] }
-
-# HTTPS client for cloud LLM adapters (ADR-0025). Pin to 0.12 to
-# dedup with the version pulled in transitively by `fastembed`/`hf-hub`;
-# rustls-tls keeps the build OpenSSL-free across macOS / Linux.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-
-# `async-trait` enables `async fn` in `dyn Trait` ports under stable Rust.
-# Per ADR-0013, port traits use `#[async_trait]` so adapters can be wired
-# behind `Arc<dyn Persistence>` etc. from `main.rs`.
-async-trait = "0.1.89"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Error handling
-anyhow = "1"
-thiserror = "2"
-
-# Embeddings (bge-m3 via ort/ONNX Runtime)
-fastembed = "5.13"
-
-# Vector store (sqlite-vec — embedded, file-backed; ADR-0011).
-# `bundled` vendors SQLite so we do not depend on a system install.
-rusqlite = { version = "0.39", features = ["bundled"] }
-sqlite-vec = "0.1.9"
-
-# Filesystem
-walkdir = "2.5"
-fd-lock = "4.0"
-dirs = "6"
-
-# Markdown + config
-pulldown-cmark = "0.13"
-toml = "1.1"
-
-# Time + hashing
-chrono = { version = "0.4", features = ["serde"] }
-blake3 = "1.8"
-
-# Serialization
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-
-# Filesystem watcher — kqueue on macOS (per ADR-0010); inotify is the
-# automatic Linux backend (no feature flag needed; not exposed as one in
-# notify 8.x). On Linux we accept defaults.
-[target.'cfg(target_os = "macos")'.dependencies.notify]
-version = "8.2"
-default-features = false
-features = ["macos_kqueue"]
-
-[target.'cfg(not(target_os = "macos"))'.dependencies]
-notify = "8.2"
-
-[dev-dependencies]
-tempfile = "3.27"
-insta = { version = "1.47", features = ["yaml"] }
+license      = "Apache-2.0"
+authors      = ["Fabricio Archanjo <farchanjo@gmail.com>"]
+repository   = "https://github.com/farchanjo/schema"
+readme       = "README.md"
 
 [profile.release]
-opt-level = 3
-lto = "thin"
+opt-level     = 3
+lto           = "thin"
 codegen-units = 1
-strip = "symbols"
+strip         = "symbols"
 
 # ─── Strict lint baseline — all three layers active (ADR-0012) ────────
 # Layer A: safety + output-critical clippy lints at `forbid` (no escape
@@ -129,8 +27,12 @@ strip = "symbols"
 # so individual `deny` overrides take precedence; `multiple_crate_versions`
 # allowed because transitive dep churn is outside our control.
 # Layer C: rustc anti-dead-code + anti-cruft lints (below). `unsafe_code`
-# at `forbid` — re-evaluate via ADR if FASE 2 needs it.
-[lints.clippy]
+# at `deny` (downgraded from `forbid` per ADR-0012 amendment 2026-04-25).
+#
+# Per ADR-0034, the lint policy lives at the workspace level so every
+# member crate inherits it via `[lints] workspace = true` in its own
+# Cargo.toml. Re-opening any lint requires an ADR amending ADR-0012.
+[workspace.lints.clippy]
 # Layer A — forbid
 panic         = { level = "forbid", priority = 1 }
 todo          = { level = "forbid", priority = 1 }
@@ -183,14 +85,14 @@ allow_attributes                = "deny"
 # Carve-out per ADR-0012: transitive dep version churn is outside our control.
 multiple_crate_versions = "allow"
 
-# Layer C: rustc anti-dead-code + anti-cruft lints. unsafe_code at
+# Layer C: rustc anti-dead-code + anti-cruft lints. `unsafe_code` at
 # `deny` (downgraded from `forbid` per ADR-0012 amendment 2026-04-25):
 # `sqlite-vec` 0.1.9 only exposes its loader as a raw `extern "C"`
 # symbol with no safe wrapper; ADR-0011 needs exactly one narrow
 # `#[expect(unsafe_code, reason = "...")]` call at extension load
 # time in `adapters/sqlite_vec_store.rs`. Every other call site in
 # the crate stays at `deny` — `expect` self-expires when removed.
-[lints.rust]
+[workspace.lints.rust]
 unsafe_code                   = "deny"
 dead_code                     = "deny"
 unused_imports                = "deny"

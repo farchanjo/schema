@@ -422,7 +422,19 @@ path = "src/main.rs"
 
 ## Evidence and amendments
 
-(none yet — this ADR is `accepted` ahead of the migration
-slice; the three commits will append entries with the
-measured fix-wave size, the dependency-tree assertion
-output, and the green-gate proof at each step.)
+- **2026-04-27 — commit 1 landed.** Root `Cargo.toml`
+  converted to `[workspace]` + `[workspace.package]` + per-
+  layer `[workspace.lints.{clippy,rust}]` blocks (the strict
+  ADR-0012 baseline), and `[profile.release]`. New member
+  `crates/schema/` carries package metadata via
+  `*.workspace = true` shorthand, full dependency block,
+  target-specific notify deps, and `[lints] workspace =
+  true`. `git mv src/ crates/schema/src/` and `git mv tests/
+  crates/schema/tests/` preserved blame across the move.
+  Validation gate: `cargo build --workspace` ✓; `cargo fmt
+  --all -- --check` ✓; `cargo clippy --all-targets
+  --all-features --workspace -- -D warnings` ✓; `cargo test
+  --workspace --all-features` ✓ — 140 tests pass (no
+  regression vs pre-migration count). `.github/workflows/
+  lint.yml` was already workspace-aware (used `--workspace`
+  before migration); no change required.
