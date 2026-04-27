@@ -40,6 +40,7 @@ use schema::adapters::mcp_server::{SchemaServer, ServerState, build_router};
 use schema::adapters::metadata_store::TomlMetadataStore;
 use schema::adapters::openai_provider::OpenAiProvider;
 use schema::adapters::project_identity::ProjectIdentity;
+use schema::adapters::registry_toml::Registry;
 use schema::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_dir};
 use schema::adapters::toml_config::SchemaConfig;
 use schema::app::cleanup::Cleanup;
@@ -51,6 +52,7 @@ use schema::cli::install::{
     InstallInputs, launchd_label, render_linux_unit, render_macos_plist,
     render_mcp_config_fragment, systemd_unit_name,
 };
+use schema::cli::project as cli_project;
 use schema::ports::{Chunker, Embedder, LlmProvider, MetadataStore, Persistence, Walker, Watcher};
 
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(500);
@@ -83,7 +85,39 @@ fn cli() -> Command {
         .subcommand(install_subcommand(config_arg.clone()))
         .subcommand(uninstall_subcommand(config_arg.clone()))
         .subcommand(service_subcommand(config_arg.clone()))
-        .subcommand(mcp_config_subcommand(config_arg))
+        .subcommand(mcp_config_subcommand(config_arg.clone()))
+        .subcommand(project_subcommand(config_arg))
+}
+
+/// `schema project register / unregister / list` (ADR-0026 amendment of ADR-0020).
+fn project_subcommand(config_arg: Arg) -> Command {
+    Command::new("project")
+        .about(
+            "Manage the daemon's project registry (ADR-0026): register, unregister, list. \
+             Filesystem-only; the daemon picks up changes on next restart.",
+        )
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("register")
+                .about("Register (or re-register) a project with the shared daemon (ADR-0026).")
+                .arg(config_arg),
+        )
+        .subcommand(
+            Command::new("unregister")
+                .about("Remove a project from the shared daemon's registry (ADR-0026).")
+                .arg(
+                    Arg::new("project-id")
+                        .long("project-id")
+                        .value_name("ID")
+                        .required(true)
+                        .help("Stable project_id (see `schema project list` to recover it)."),
+                ),
+        )
+        .subcommand(
+            Command::new("list")
+                .about("List every project registered with the shared daemon (ADR-0026)."),
+        )
 }
 
 /// Shared `--config` argument used by every subcommand.
@@ -185,6 +219,28 @@ fn mcp_config_subcommand(config_arg: Arg) -> Command {
         .arg(config_arg)
 }
 
+/// Dispatch the `schema project ...` subcommands. Each verb operates on
+/// the platform-default registry path (`Registry::default_path`) so the
+/// shared daemon and the CLI agree on the location without an extra
+/// flag (ADR-0026 amendment of ADR-0020).
+fn run_project(matches: &ArgMatches) -> Result<()> {
+    let registry_path = Registry::default_path()?;
+    match matches.subcommand() {
+        Some(("register", sub)) => cli_project::register(&config_from(sub), &registry_path),
+        Some(("unregister", sub)) => {
+            let project_id = sub
+                .get_one::<String>("project-id")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("--project-id is required"))?;
+            cli_project::unregister(&project_id, &registry_path)
+        }
+        Some(("list", _)) => cli_project::list(&registry_path),
+        _ => Err(anyhow::anyhow!(
+            "unknown `project` subcommand; expected `register`, `unregister`, or `list`"
+        )),
+    }
+}
+
 fn config_from(matches: &ArgMatches) -> PathBuf {
     matches
         .get_one::<PathBuf>("config")
@@ -221,6 +277,7 @@ async fn main() -> Result<()> {
             )),
         },
         Some(("mcp-config", sub)) => run_mcp_config(&config_from(sub)),
+        Some(("project", sub)) => run_project(sub),
         Some((other, _)) => Err(anyhow::anyhow!("unknown subcommand: {other}")),
         None => run_serve(PathBuf::from("schema.toml")).await,
     }
