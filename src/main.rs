@@ -928,13 +928,22 @@ fn run_service_status(config: &Path) -> Result<()> {
 }
 
 /// Print the `mcpServers` JSON fragment for the running server.
-fn run_mcp_config(config: &Path) -> Result<()> {
-    let (cfg, resolved_config) = SchemaConfig::resolve(Some(config))?;
-    let identity = ProjectIdentity::resolve(
-        &cfg.project.name,
-        &SchemaConfig::project_root(&resolved_config)?,
-    )?;
-    let snippet = render_mcp_config_fragment(&identity)?;
+///
+/// ADR-0027 makes the daemon's `endpoint.toml` global (one per
+/// workstation), so the verb no longer needs `--config <path>`. The
+/// `--config` argument is still accepted for back-compat with older
+/// muscle memory but ignored; the snippet always describes the
+/// shared daemon endpoint.
+fn run_mcp_config(_config: &Path) -> Result<()> {
+    let endpoint_path = global_endpoint_path()?;
+    let endpoint = Endpoint::load(&endpoint_path).with_context(|| {
+        format!(
+            "reading global {}; is the schema daemon running? (start it with `schema daemon` \
+             or via the launchd / systemd unit installed by `schema install --daemon`)",
+            endpoint_path.display()
+        )
+    })?;
+    let snippet = render_mcp_config_fragment(&endpoint);
     let stdout = io::stdout();
     let mut out = stdout.lock();
     writeln!(out, "{{")?;

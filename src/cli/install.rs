@@ -182,29 +182,21 @@ pub fn systemd_unit_name(project_id: &str) -> String {
     format!("schema-{project_id}.service")
 }
 
-/// Print an `mcpServers` JSON snippet ready to paste into a consumer's
-/// `.mcp.json`. Reads `endpoint.toml` from the project cache; fails with a
-/// descriptive error if the server has not been started yet.
+/// Render an `mcpServers` JSON snippet ready to paste into a consumer's
+/// `.mcp.json`.
 ///
-/// Output is a fragment, not a full `.mcp.json`. The operator merges it into
-/// their existing config.
+/// The snippet carries `"type": "http"` per the MCP client configuration
+/// schema (Claude Code rejects entries that miss it with
+/// `Does not adhere to MCP server configuration schema`).
 ///
-/// # Errors
-/// Returns an error if `endpoint.toml` is missing or unparseable.
-pub fn render_mcp_config_fragment(identity: &ProjectIdentity) -> Result<String> {
-    let endpoint_path = identity.cache_dir.join("endpoint.toml");
-    let endpoint = Endpoint::load(&endpoint_path).with_context(|| {
-        format!(
-            "reading {}; is the schema server running for project {}?",
-            endpoint_path.display(),
-            identity.id
-        )
-    })?;
-    let snippet = format!(
-        "  \"schema\": {{\n    \"url\": \"{}\",\n    \"headers\": {{\n      \"Authorization\": \"Bearer {}\"\n    }}\n  }}",
+/// Output is a fragment, not a full `.mcp.json`. The operator merges it
+/// into their existing config.
+#[must_use]
+pub fn render_mcp_config_fragment(endpoint: &Endpoint) -> String {
+    format!(
+        "  \"schema\": {{\n    \"type\": \"http\",\n    \"url\": \"{}\",\n    \"headers\": {{\n      \"Authorization\": \"Bearer {}\"\n    }}\n  }}",
         endpoint.url, endpoint.token,
-    );
-    Ok(snippet)
+    )
 }
 
 #[cfg(test)]
