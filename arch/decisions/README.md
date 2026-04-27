@@ -54,3 +54,4 @@ pointing at the CI check that proves the decision is still in effect.
 | 0030 | [Stable consumer-side MCP wiring: `.mcp.json` policy + `schema mcp-shim`](./0030-stable-consumer-mcp-wiring.md) | accepted | 2026-04-27 |
 | 0031 | [Secret management for the schema daemon (LLM provider keys)](./0031-secret-management-for-daemon.md) | accepted | 2026-04-27 |
 | 0032 | [Rename MCP tool `query` → `search` + permissive `Option<usize>` deserializer](./0032-rename-query-tool-and-permissive-numeric-deserializer.md) | accepted | 2026-04-27 |
+| 0033 | [Recall: session-transcript retrieval as a separate bounded context](./0033-recall-bounded-context.md) | accepted | 2026-04-27 |
