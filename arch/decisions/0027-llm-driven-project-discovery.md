@@ -539,7 +539,52 @@ answer to the same question.
     `cli/project.rs` tests). 5 integration. Strict-lint
     gate green; `cargo fmt --all -- --check` clean.
 
-- **2026-04-27 — refactor PR #4 of 4 landed (this commit).**
+- **2026-04-27 — daemon templates landed (post-refactor follow-up).**
+  Workstation-level `schema install --daemon` /
+  `schema uninstall --daemon` verbs + new launchd / systemd
+  templates that invoke `schema daemon` directly (no per-project
+  `{project_id}` slot, no `--config` flag).
+  - `src/cli/templates/launchd-daemon.plist.template`: macOS
+    `LaunchAgent` with `Label = com.farchanjo.schema.daemon`,
+    `ProgramArguments = ["{binary_path}", "daemon"]`, the
+    `SoftResourceLimits.NumberOfFiles = 10240` knob the four
+    operator daemons needed in the ADR-0026 era to dodge
+    kqueue fd exhaustion across N projects.
+  - `src/cli/templates/systemd-daemon.service.template`: Linux
+    user unit with `ExecStart = {binary_path} daemon`,
+    `LimitNOFILE = 10240` for the same reason.
+  - `src/cli/install.rs`: new `DaemonInstallInputs` struct (no
+    `config_path` / `project_id` fields), `render_macos_daemon_plist`
+    / `render_linux_daemon_unit` helpers, public constants
+    `DAEMON_LAUNCHD_LABEL` / `DAEMON_SYSTEMD_UNIT_NAME`. Three
+    new unit tests cover slot substitution + label constants.
+  - `src/main.rs`: `schema install --daemon` (with optional
+    `--nice <N>`, default 5) and `schema uninstall --daemon`
+    verbs. `--service` and `--daemon` are mutually exclusive
+    via clap `conflicts_with`. Existing per-project
+    `--service / --config` flow untouched. Helpers
+    `daemon_unit_path`, `write_daemon_unit_file`,
+    `daemon_unit_label` keep each `run_*` fn under the 30-line
+    cognitive budget. `print_install_hint` /
+    `print_uninstall_hint` collapsed into shared
+    `print_load_hint` / `print_unload_hint` helpers
+    parameterised by label so per-project + daemon paths reuse
+    the same operator-prompt shape.
+  - 92 unit tests pass (was 89; +3 from the new template
+    rendering tests). 5 integration. Strict-lint gate green;
+    `cargo fmt --all -- --check` clean.
+  - Operator cutover (per `arch/operations/runbook.md`
+    "Migration to ADR-0027 step 5") is now mechanical:
+    ```
+    schema install --daemon
+    launchctl bootstrap gui/$(id -u) \
+      ~/Library/LaunchAgents/com.farchanjo.schema.daemon.plist
+    ```
+    No more "until then run the daemon under your terminal-of-
+    choice" caveat — the templated unit is the official
+    deployment shape.
+
+- **2026-04-27 — refactor PR #4 of 4 landed.**
   Daemon-mode watcher recovery + ADR-0019 / ADR-0020 /
   ADR-0021 forward-pointing amendments + runbook cutover
   sequence. Closes the ADR-0027 refactor loop.

@@ -1,0 +1,16 @@
+[Unit]
+Description=schema MCP daemon (ADR-0027 — workstation-level, lazy resolve via working_directory)
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={binary_path} daemon
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+Nice={nice}
+LimitNOFILE=10240
+StandardError=append:{stderr_path}
+
+[Install]
+WantedBy=default.target

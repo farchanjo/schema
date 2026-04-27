@@ -20,11 +20,88 @@ use crate::adapters::endpoint_toml::Endpoint;
 use crate::adapters::project_identity::ProjectIdentity;
 use crate::adapters::toml_config::SchemaConfig;
 
-/// macOS `LaunchAgent` plist template (ADR-0020).
+/// macOS `LaunchAgent` plist template — per-project unit (ADR-0020).
 const MACOS_PLIST_TEMPLATE: &str = include_str!("templates/launchd.plist.template");
 
-/// Linux systemd user unit template (ADR-0020).
+/// Linux systemd user unit template — per-project unit (ADR-0020).
 const LINUX_UNIT_TEMPLATE: &str = include_str!("templates/systemd.service.template");
+
+/// macOS `LaunchAgent` plist template — workstation-level daemon (ADR-0027).
+const MACOS_DAEMON_PLIST_TEMPLATE: &str = include_str!("templates/launchd-daemon.plist.template");
+
+/// Linux systemd user unit template — workstation-level daemon (ADR-0027).
+const LINUX_DAEMON_UNIT_TEMPLATE: &str = include_str!("templates/systemd-daemon.service.template");
+
+/// Inputs needed to render a workstation-level daemon unit (ADR-0027).
+///
+/// No `config_path` or `project_id` slots — the daemon resolves projects
+/// lazily from each tool call's `working_directory`. `nice` and
+/// `stderr_path` carry over from the per-project shape so the operator
+/// keeps the same log discipline + CPU politeness across deployment
+/// modes.
+#[derive(Debug, Clone)]
+pub struct DaemonInstallInputs {
+    pub binary_path: PathBuf,
+    pub stderr_path: PathBuf,
+    pub nice: u8,
+}
+
+impl DaemonInstallInputs {
+    /// Resolve daemon install inputs. `binary_path` defaults to the
+    /// ADR-0014 install path; `stderr_path` lands under the
+    /// platform-default daemon state directory next to the global
+    /// `endpoint.toml` (`~/Library/Application Support/schema/`
+    /// on macOS; `~/.local/state/schema/` on Linux).
+    ///
+    /// # Errors
+    /// Returns an error if the home directory cannot be resolved.
+    pub fn resolve(binary_override: Option<PathBuf>, nice: u8) -> Result<Self> {
+        let binary_path = binary_override.unwrap_or_else(default_binary_path);
+        let stderr_path = default_daemon_stderr_path()?;
+        Ok(Self {
+            binary_path,
+            stderr_path,
+            nice,
+        })
+    }
+}
+
+fn default_daemon_stderr_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        anyhow::anyhow!("could not resolve home directory for daemon stderr path")
+    })?;
+    let suffix: &Path = if cfg!(target_os = "macos") {
+        Path::new("Library/Application Support/schema/stderr.log")
+    } else {
+        Path::new(".local/state/schema/stderr.log")
+    };
+    Ok(home.join(suffix))
+}
+
+/// Workstation-level launchd label (ADR-0027): no `<project_id>` slot.
+pub const DAEMON_LAUNCHD_LABEL: &str = "com.farchanjo.schema.daemon";
+
+/// Workstation-level systemd unit name (ADR-0027): no `<project_id>` slot.
+pub const DAEMON_SYSTEMD_UNIT_NAME: &str = "schema-daemon.service";
+
+/// Render the workstation-level daemon plist (macOS, ADR-0027).
+#[must_use]
+pub fn render_macos_daemon_plist(inputs: &DaemonInstallInputs) -> String {
+    substitute_daemon_template(MACOS_DAEMON_PLIST_TEMPLATE, inputs)
+}
+
+/// Render the workstation-level daemon systemd unit (Linux, ADR-0027).
+#[must_use]
+pub fn render_linux_daemon_unit(inputs: &DaemonInstallInputs) -> String {
+    substitute_daemon_template(LINUX_DAEMON_UNIT_TEMPLATE, inputs)
+}
+
+fn substitute_daemon_template(template: &str, inputs: &DaemonInstallInputs) -> String {
+    template
+        .replace("{binary_path}", &inputs.binary_path.to_string_lossy())
+        .replace("{stderr_path}", &inputs.stderr_path.to_string_lossy())
+        .replace("{nice}", &inputs.nice.to_string())
+}
 
 /// Inputs needed to render a service file.
 #[derive(Debug, Clone)]
@@ -140,7 +217,9 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        InstallInputs, launchd_label, render_linux_unit, render_macos_plist, systemd_unit_name,
+        DAEMON_LAUNCHD_LABEL, DAEMON_SYSTEMD_UNIT_NAME, DaemonInstallInputs, InstallInputs,
+        launchd_label, render_linux_daemon_unit, render_linux_unit, render_macos_daemon_plist,
+        render_macos_plist, systemd_unit_name,
     };
 
     fn fixture_inputs() -> InstallInputs {
@@ -194,5 +273,51 @@ mod tests {
             systemd_unit_name("demo-a3f9c2d1"),
             "schema-demo-a3f9c2d1.service"
         );
+    }
+
+    fn fixture_daemon_inputs() -> DaemonInstallInputs {
+        DaemonInstallInputs {
+            binary_path: PathBuf::from("/usr/local/bin/schema"),
+            stderr_path: PathBuf::from("/Users/op/Library/Application Support/schema/stderr.log"),
+            nice: 5,
+        }
+    }
+
+    #[test]
+    fn macos_daemon_plist_substitutes_every_slot() {
+        let rendered = render_macos_daemon_plist(&fixture_daemon_inputs());
+        assert!(!rendered.contains('{'), "no leftover slots: {rendered}");
+        assert!(rendered.contains("/usr/local/bin/schema"));
+        assert!(rendered.contains("<string>daemon</string>"));
+        assert!(rendered.contains("com.farchanjo.schema.daemon"));
+        assert!(rendered.contains("<integer>5</integer>"), "Nice");
+        assert!(rendered.contains("<key>SoftResourceLimits</key>"));
+        assert!(
+            rendered.contains("<integer>10240</integer>"),
+            "NumberOfFiles 10240 to dodge kqueue fd exhaustion across N projects"
+        );
+        assert!(!rendered.contains("--config"), "daemon takes no --config");
+        assert!(
+            !rendered.contains("project_id"),
+            "daemon plist must not carry per-project slot"
+        );
+    }
+
+    #[test]
+    fn linux_daemon_unit_substitutes_every_slot() {
+        let rendered = render_linux_daemon_unit(&fixture_daemon_inputs());
+        assert!(!rendered.contains('{'), "no leftover slots: {rendered}");
+        assert!(rendered.contains("ExecStart=/usr/local/bin/schema daemon"));
+        assert!(!rendered.contains("--config"), "daemon takes no --config");
+        assert!(rendered.contains("Nice=5"));
+        assert!(rendered.contains("LimitNOFILE=10240"));
+        assert!(rendered.contains("Restart=on-failure"));
+        assert!(rendered.contains("TimeoutStopSec=10s"));
+    }
+
+    #[test]
+    fn daemon_label_constants_match_runbook() {
+        assert_eq!(DAEMON_LAUNCHD_LABEL, "com.farchanjo.schema.daemon");
+        assert_eq!(DAEMON_SYSTEMD_UNIT_NAME, "schema-daemon.service");
     }
 }
