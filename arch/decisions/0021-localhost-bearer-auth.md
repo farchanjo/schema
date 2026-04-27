@@ -410,3 +410,19 @@ friction. Both shapes live in `arch/operations/`.
   constant-time-comparison follow-up are **all preserved**
   — they apply to the workstation bearer. See ADR-0027
   §"Decision" and ADR-0027 §"Slice rollback / refactor plan".
+
+- **2026-04-27 — `mcp-shim` follow-up promoted to ADR-0030.**
+  This ADR's §"Cross-references and follow-ups" listed
+  `schema mcp-shim` proxy (Shape B) as a follow-up "to
+  promote to a real ADR once Shape A's friction is observed
+  in practice". Friction surfaced on 2026-04-27: a stale
+  `.mcp.json` (port `:56612`, old token) blocked a Claude
+  Code session against a daemon that had restarted onto
+  port `:57731` with a rotated token (debug capture
+  `/Users/farchanjo/.claude/debug/0f8782db-…txt` lines
+  117–140). ADR-0030 promotes the `mcp-shim` proxy to
+  the canonical consumer-wiring shape and adds a
+  gitignore policy for `.mcp.json`. The bearer-auth
+  contract documented in this ADR is unchanged — the
+  shim is a consumer of the same `endpoint.toml` shape
+  defined here.
