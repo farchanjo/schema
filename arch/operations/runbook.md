@@ -459,6 +459,209 @@ ls -lh ~/.cache/schema/models/
 ls -lh ~/.cache/schema/projects/<id>/store.db
 ```
 
+## Migration to ADR-0026 (shared daemon)
+
+> **Status (2026-04-26):** ADR-0026 is `accepted` (direction
+> locked). Code lands behind a fitness-function gate (two-
+> project canary E2E). Per-project units installed under
+> ADR-0020 keep running in production until the shared daemon
+> ships and that gate is green. **Operators take no action
+> yet.** This section is the migration plan, written ahead of
+> the code, so the cutover is mechanical when it lands.
+
+### What changes
+
+| Artefact | Before (ADR-0019/0020/0021) | After (ADR-0026) |
+|----------|-----------------------------|------------------|
+| Process count | N (one per project) | 1 (workstation-level) |
+| ONNX session in RAM | N × ~1.7 GB | 1 × ~1.7 GB |
+| launchd / systemd unit | N × `com.farchanjo.schema.<project_id>` | 1 × `com.farchanjo.schema.daemon` (macOS) / `schema-daemon.service` (Linux) |
+| Project membership | implicit (one `--config` per unit) | explicit (`schema project register --config <path>`) |
+| Registry file | none (each unit holds its config path) | `~/Library/Application Support/schema/registry.toml` (macOS) / `~/.local/state/schema/registry.toml` (Linux) — daemon-internal state |
+| `endpoint.toml` per project | one URL + one token, daemon listens on a per-project random port | one URL (shared, random port) + one token **per project**, all `endpoint.toml` files point at the same URL |
+| `MetadataStore` / `VectorStore` on disk | one `store.db` per project (ADR-0008) | unchanged — one `store.db` per project, opened by the shared daemon |
+| `.mcp.json` on consumer side | per-project `url` + per-project `Bearer` | unchanged shape; only the `url` is now shared across projects, `Bearer` still differs per project |
+| Bearer validator | `eq` against single token | `Map<TokenHash, ProjectId>`, defence-in-depth against URL/token mismatch |
+
+### What does **not** change
+
+- ADR-0008 (per-project cache directory) — every registered
+  project still has its own `~/.cache/schema/projects/
+  <project_id>/` with its own `store.db`. No combined index.
+- ADR-0014 (install + codesign) — binary still installed
+  once at `/usr/local/bin/schema`, signed once.
+- ADR-0019 transport — Streamable HTTP via rmcp + axum,
+  `LocalSessionManager`, `with_stateful_mode(true)`,
+  localhost-only allowed hosts, SIGTERM drain.
+- ADR-0021 token secrecy — still UUIDv4 per project, still
+  `0600` on `endpoint.toml`, still localhost-bound, still
+  rotated on daemon restart.
+- Consumer-side `.mcp.json` shape — no client edit needed at
+  cutover beyond regenerating with the new `url`/token.
+- ADR-0024 E2E test runner (Python pytest + httpx) — the
+  ADR-0026 canary fitness function lives in the same suite.
+
+### Cutover sequence (operator, when the code ships)
+
+> Numbered steps are run **in order** to avoid a window
+> where neither old nor new daemons serve a project.
+
+1. **Update `schema` to a build that contains the shared-
+   daemon code path.**
+
+   ```bash
+   cd ~/dev/mcp-schema
+   cargo build --release
+   sudo install -m 0755 target/release/schema /usr/local/bin/schema
+   sudo codesign --sign "Apple Development: Fabricio Fonseca (J3LVNXCU3U)" \
+                 --options runtime --force /usr/local/bin/schema   # macOS only
+   schema --version
+   ```
+
+2. **Inventory current per-project units (ADR-0020).**
+
+   ```bash
+   # macOS:
+   launchctl list | grep com.farchanjo.schema
+   # Linux:
+   systemctl --user list-units 'schema-*' --no-legend
+   ```
+
+   Save the list. Each entry maps to a `project_id` you must
+   re-register against the new daemon.
+
+3. **Stop and remove the per-project units.**
+
+   ```bash
+   # macOS, per project_id:
+   launchctl bootout gui/$(id -u)/com.farchanjo.schema.<project_id>
+   schema uninstall --service --config <project>/schema.toml
+
+   # Linux, per project_id:
+   systemctl --user disable --now schema-<project_id>.service
+   schema uninstall --service --config <project>/schema.toml
+   ```
+
+   This deletes the plist / unit file but **preserves
+   `~/.cache/schema/projects/<project_id>/`** (stores stay on
+   disk, ADR-0008).
+
+4. **Install the shared daemon unit (one verb, no per-
+   project repetition).**
+
+   ```bash
+   schema install --service              # no --config flag
+   # macOS:
+   launchctl bootout gui/$(id -u)/com.farchanjo.schema.daemon 2>/dev/null
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.farchanjo.schema.daemon.plist
+   # Linux:
+   systemctl --user daemon-reload
+   systemctl --user enable --now schema-daemon.service
+   ```
+
+   The daemon boots **with no projects registered**. It binds
+   localhost on a single random port and writes one global
+   admin endpoint file (admin token + URL) at
+   `~/Library/Application Support/schema/admin-endpoint.toml`
+   (macOS) / `~/.local/state/schema/admin-endpoint.toml`
+   (Linux). It does **not** open any `store.db` until step 5.
+
+5. **Register each project. Order does not matter.**
+
+   ```bash
+   for cfg in \
+     ~/dev/mcp-schema/schema.toml \
+     ~/dev/lowcow-platform/schema.toml \
+     ~/dev/alloy-spec2/schema.toml \
+     ~/dev/alloy-specs/schema.toml \
+   ; do
+     schema project register --config "$cfg"
+   done
+   schema project list   # sanity
+   ```
+
+   Each `register` opens that project's existing `store.db`
+   (no re-embed; ADR-0008 stores carry over), runs an
+   incremental delta-sync (cheap, hashes already in the
+   manifest), and adds a row to the daemon's project
+   registry. Per-project `endpoint.toml` is rewritten to
+   point at the **shared** URL with a freshly minted bearer
+   token.
+
+6. **Refresh each consumer's `.mcp.json`.**
+
+   ```bash
+   for proj in ~/dev/mcp-schema ~/dev/lowcow-platform ~/dev/alloy-spec2 ~/dev/alloy-specs; do
+     ( cd "$proj" && schema mcp-config --config schema.toml > .mcp.json )
+   done
+   ```
+
+   `.mcp.json` keeps the same shape as today; the `url` is
+   now identical across files (one daemon), the `Bearer`
+   still differs per project. Open Claude Code in each
+   project to confirm the connection is live.
+
+7. **Run the canary fitness check (manual smoke).**
+
+   ```bash
+   pytest tests/e2e/test_adr0026_isolation.py -v
+   ```
+
+   This is the same fitness function that gates merge in
+   CI — confirm it is green on your live workstation
+   too. A failure here means the shared daemon is bleeding
+   chunks across projects; **roll back immediately**
+   (step 8) and file an incident against ADR-0026.
+
+8. **Rollback (if anything in step 5–7 fails).**
+
+   ```bash
+   # Stop the shared daemon:
+   launchctl bootout gui/$(id -u)/com.farchanjo.schema.daemon          # macOS
+   systemctl --user disable --now schema-daemon.service                # Linux
+   schema uninstall --service                                          # workstation-level
+
+   # Reinstall per-project units (the old plists/units are
+   # already deleted in step 3; re-run install verb per project):
+   for cfg in ~/dev/mcp-schema/schema.toml ~/dev/lowcow-platform/schema.toml \
+              ~/dev/alloy-spec2/schema.toml ~/dev/alloy-specs/schema.toml; do
+     schema install --service --config "$cfg"
+   done
+   # Then bootstrap each per-project unit (see "Configure a
+   # consumer project" above).
+   ```
+
+   `~/.cache/schema/projects/*/` is untouched throughout —
+   no re-embed required on rollback. Per-project bearer
+   tokens regenerate on each daemon restart by ADR-0021,
+   so `.mcp.json` files need to be re-rendered with
+   `schema mcp-config` after rollback.
+
+### Red flags during migration
+
+- **`schema project register` reports `corpus path X does
+  not exist`** — same root cause as the FASE 1 lifecycle:
+  consumer `schema.toml` has a stale path. Fix the
+  `schema.toml`, re-register. ADR-0019 daemons would
+  KeepAlive-loop on this; the shared daemon **must** keep
+  running for the other projects (failure containment is
+  one of ADR-0026's drivers — file an incident if a single
+  project's invalid config takes the whole daemon down).
+- **`launchctl print` shows `last exit code = 1` on the
+  shared unit** — read
+  `~/Library/Caches/schema/daemon/stderr.log`; do **not**
+  delete the per-project caches in panic. ADR-0008 paths
+  are the source of truth for embedded chunks; losing them
+  forces a full re-embed.
+- **Canary fitness E2E failure post-cutover** — same as
+  step 7 failure path. Roll back via step 8. Cross-project
+  bleed is the **one** condition where ADR-0026 says "stop
+  the daemon, do not paper over".
+- **Memory footprint of the shared daemon higher than
+  Σ-of-old-daemons** — unexpected; means per-project
+  retention got worse, not better. ADR-0027 (memory budget,
+  follow-up to ADR-0026) is the place to track this.
+
 ## Uninstall
 
 ```bash
