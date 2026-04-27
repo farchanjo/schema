@@ -16,7 +16,7 @@ const HASH_PREFIX_LEN: usize = 8; // 64 bits — collision-safe for human-scale 
 /// Stable identifier for a project on this machine.
 ///
 /// Format: `<sanitised-name>-<8-hex-of-blake3-of-canonical-path>`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ProjectId(String);
 
 impl ProjectId {

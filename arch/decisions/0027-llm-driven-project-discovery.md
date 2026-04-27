@@ -517,7 +517,7 @@ answer to the same question.
   "accepted (impl gated)" to "accepted (live)" once green in
   CI on the cutover PR.
 
-- **2026-04-26 — refactor PR #1 of 4 landed (this commit).**
+- **2026-04-26 — refactor PR #1 of 4 landed.**
   Operator-facing CLI surface for the (now-superseded)
   registry deleted. ADR-0026 slice 3 reverted in full.
   - `src/cli/project.rs` removed (entire file).
@@ -538,3 +538,63 @@ answer to the same question.
   - 103 unit tests pass (was 110; -7 from the deleted
     `cli/project.rs` tests). 5 integration. Strict-lint
     gate green; `cargo fmt --all -- --check` clean.
+
+- **2026-04-27 — refactor PR #2 of 4 landed (this commit).**
+  Single-endpoint daemon + lazy resolve. ADR-0026 slices
+  1, 2a, and 4 reverted; slice 4b's `schema daemon` runtime
+  rewritten around the new shape; ADR-0019 single-project
+  `schema serve` path preserved by routing through the
+  same `Daemon` (pre-wired with one project).
+  - `src/adapters/registry_toml.rs`, `MultiTenantBearerValidator`,
+    `ProjectTokenRegistry`, `Mount`, `build_multi_tenant_router`,
+    `per_project_router` removed. `BearerValidator` (single-token)
+    is the only validator left.
+  - `src/app/daemon.rs` rewritten:
+    `Daemon { embedder, llm_provider,
+    projects: Arc<RwLock<HashMap<ProjectId, Arc<ProjectInstance>>>> }`,
+    with `Daemon::new`, `Daemon::new_pre_wired`,
+    `Daemon::resolve_or_wire(&working_directory)`. Walk-up
+    helper finds `schema.toml` from the LLM-supplied
+    directory; ADR-0008 path-keyed identity selects exactly
+    one `store.db`. Double-check pattern under the write
+    lock prevents wiring the same project twice on near-
+    simultaneous first calls. `ProjectId` gains `Hash` to
+    serve as the `HashMap` key.
+  - `src/adapters/mcp_server.rs`:
+    `ServerState` removed. `SchemaServer { daemon: Arc<Daemon> }`.
+    Every retrieval / cleanup / synthesize tool gains a
+    `working_directory: String` parameter; handlers call
+    `self.resolve(&params.working_directory)` and dispatch
+    to the resolved `ProjectInstance`. `ping` is the only
+    project-less tool. `with_state` → `with_daemon`.
+    `build_workspace_context` split into four helpers to
+    stay under the 30-line budget.
+  - `src/main.rs`: `run_serve` now wires one
+    `ProjectInstance` exactly as before, then puts it
+    inside `Daemon::new_pre_wired` and serves through the
+    new `SchemaServer::with_daemon`. `run_daemon` calls
+    `Daemon::new` (empty), writes one **global**
+    `endpoint.toml` at `~/Library/Application Support/
+    schema/endpoint.toml` (macOS) / `~/.local/state/
+    schema/endpoint.toml` (Linux) carrying
+    `url = "http://127.0.0.1:<port>/mcp"` + the
+    workstation bearer. No per-slot startup loop, no per-
+    project endpoint files, no per-mount tokens.
+  - 89 unit tests pass (was 103; -14 from the deleted
+    `MultiTenantBearerValidator` / `ProjectTokenRegistry` /
+    `Registry` tests, +3 new daemon walk-up tests in
+    `src/app/daemon.rs`). 5 integration. Strict-lint gate
+    green; `cargo fmt --all -- --check` clean.
+  - Note on the **watcher loop in daemon mode**: lazy
+    `resolve_or_wire` does **not** spawn the watcher today
+    — only single-project `run_serve` (which spawns it
+    directly before pre-wiring the daemon) does. That is
+    a regression on ADR-0010 for daemon mode and is
+    explicitly out of scope for this PR. Refactor PR #3
+    (canary E2E) does not depend on watchers; refactor PR
+    #4 wires the watcher into `Daemon::wire_and_insert`
+    side-effect or as a per-slot task spawned by the
+    daemon entry point. **Tracked in this Evidence entry
+    rather than introducing a separate ADR**, since it is
+    a recovery of pre-existing behaviour rather than a
+    new decision.

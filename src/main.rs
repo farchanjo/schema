@@ -35,15 +35,14 @@ use schema::adapters::anthropic_provider::AnthropicProvider;
 use schema::adapters::endpoint_toml::Endpoint;
 use schema::adapters::fastembed_embedder::FastembedEmbedder;
 use schema::adapters::filesystem::NotifyWatcher;
-use schema::adapters::mcp_server::{SchemaServer, ServerState, build_router};
+use schema::adapters::mcp_server::{SchemaServer, build_router};
 use schema::adapters::metadata_store::TomlMetadataStore;
 use schema::adapters::openai_provider::OpenAiProvider;
 use schema::adapters::project_identity::ProjectIdentity;
-use schema::adapters::registry_toml::Registry;
 use schema::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_dir};
 use schema::adapters::toml_config::SchemaConfig;
 use schema::app::cleanup::Cleanup;
-use schema::app::daemon::{Daemon, ProjectSlot};
+use schema::app::daemon::Daemon;
 use schema::app::delta_sync::{DeltaSync, corpus_paths_from_config};
 use schema::app::project_instance::ProjectInstance;
 use schema::app::watcher_consumer::run_watcher_consumer;
@@ -324,16 +323,16 @@ fn resolve_auto(
 
 async fn run_serve(config: PathBuf) -> Result<()> {
     let (cfg, identity) = resolve_serve_context(&config)?;
-    let project = wire_serve_services(cfg, identity).await?;
+    let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3()?));
+    let llm_provider = resolve_llm_provider(&cfg)?;
+    let project = ProjectInstance::wire(cfg, identity, &embedder, llm_provider.clone()).await?;
+    let initial = project.sync.run().await?;
+    tracing::info!(?initial, "initial delta-sync complete");
+    spawn_watcher(&project.config, &project.identity, project.sync.clone())?;
     let endpoint_path = project.identity.cache_dir.join("endpoint.toml");
-    let state = ServerState {
-        config: project.config,
-        identity: project.identity,
-        query: project.query,
-        cleanup: project.cleanup,
-        synthesize: project.synthesize,
-    };
-    serve_http(SchemaServer::with_state(state), endpoint_path).await
+    let daemon = Arc::new(Daemon::new_pre_wired(embedder, llm_provider, project));
+    let server = SchemaServer::with_daemon(daemon);
+    serve_http(server, endpoint_path).await
 }
 
 fn resolve_serve_context(config: &Path) -> Result<(SchemaConfig, ProjectIdentity)> {
@@ -349,19 +348,6 @@ fn resolve_serve_context(config: &Path) -> Result<(SchemaConfig, ProjectIdentity
         "schema config loaded; cache resolved",
     );
     Ok((cfg, identity))
-}
-
-async fn wire_serve_services(
-    cfg: SchemaConfig,
-    identity: ProjectIdentity,
-) -> Result<ProjectInstance> {
-    let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3()?));
-    let llm_provider = resolve_llm_provider(&cfg)?;
-    let project = ProjectInstance::wire(cfg, identity, &embedder, llm_provider).await?;
-    let initial = project.sync.run().await?;
-    tracing::info!(?initial, "initial delta-sync complete");
-    spawn_watcher(&project.config, &project.identity, project.sync.clone())?;
-    Ok(project)
 }
 
 /// Start the Streamable HTTP MCP server (ADR-0019).
@@ -397,87 +383,57 @@ async fn serve_http(server: SchemaServer, endpoint_path: PathBuf) -> Result<()> 
 /// the in-flight sessions are drained and every `endpoint.toml` is
 /// removed.
 async fn run_daemon() -> Result<()> {
-    let registry_path = Registry::default_path()?;
-    let registry = Registry::load(&registry_path)
-        .with_context(|| format!("loading registry at {}", registry_path.display()))?;
-    if registry.is_empty() {
-        tracing::warn!(
-            registry = %registry_path.display(),
-            "no projects registered; daemon will serve /health only — \
-             register projects with `schema project register --config <path>`",
-        );
-    }
-
     let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3()?));
     let llm_provider = resolve_llm_provider_for_daemon()?;
+    let daemon = Arc::new(Daemon::new(embedder, llm_provider));
+    tracing::info!("daemon: empty (lazy resolve via working_directory per ADR-0027)");
 
-    let daemon = Daemon::wire(&registry, embedder, llm_provider).await?;
-    tracing::info!(project_count = daemon.len(), "daemon: projects wired");
-    serve_daemon(daemon).await
-}
-
-/// Bind the listener, run startup side effects per slot, build the
-/// router, serve until shutdown, then clean up `endpoint.toml` files.
-/// Split out of `run_daemon` to keep both functions under the
-/// 30-line cognitive-complexity budget.
-async fn serve_daemon(daemon: Daemon) -> Result<()> {
     let listener = bind_localhost_listener().await?;
     let bound = listener.local_addr()?;
     tracing::info!(address = %bound, "daemon HTTP listener bound");
 
-    let endpoint_paths = startup_each_slot(&daemon, &bound).await?;
+    let token = Uuid::new_v4().to_string();
+    let endpoint_path = global_endpoint_path()?;
+    write_global_endpoint_file(&endpoint_path, &bound, &token)?;
 
     let cancellation = CancellationToken::new();
-    let router = daemon.into_router(&cancellation);
+    let server = SchemaServer::with_daemon(daemon);
+    let router = build_router(server, token, cancellation.clone());
     let serve_result = run_axum_until_shutdown(listener, router, cancellation).await;
 
-    for path in &endpoint_paths {
-        cleanup_endpoint_file(path);
-    }
+    cleanup_endpoint_file(&endpoint_path);
     serve_result
 }
 
-/// Per-slot startup side effects: write `endpoint.toml`, run initial
-/// delta-sync, spawn the watcher loop. Order matches the
-/// single-project `wire_serve_services` contract — `endpoint.toml`
-/// is written **after** initial sync so the file's existence implies
-/// the daemon is ready to serve queries.
-async fn startup_each_slot(daemon: &Daemon, bound: &SocketAddr) -> Result<Vec<PathBuf>> {
-    let mut endpoint_paths = Vec::with_capacity(daemon.slots.len());
-    for slot in &daemon.slots {
-        let endpoint_path = slot.instance.identity.cache_dir.join("endpoint.toml");
-        slot.instance.sync.clone().run().await?;
-        tracing::info!(
-            project = %slot.project_id,
-            "daemon: initial delta-sync complete",
-        );
-        spawn_watcher(
-            &slot.instance.config,
-            &slot.instance.identity,
-            slot.instance.sync.clone(),
-        )?;
-        write_daemon_endpoint_file(&endpoint_path, bound, slot)?;
-        endpoint_paths.push(endpoint_path);
-    }
-    Ok(endpoint_paths)
+/// Resolve the platform-default global endpoint.toml path (ADR-0027).
+///
+/// macOS: `~/Library/Application Support/schema/endpoint.toml`.
+/// Linux: `~/.local/state/schema/endpoint.toml`.
+fn global_endpoint_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| {
+        anyhow::anyhow!("could not resolve home directory for global endpoint.toml")
+    })?;
+    let suffix: &Path = if cfg!(target_os = "macos") {
+        Path::new("Library/Application Support/schema/endpoint.toml")
+    } else {
+        Path::new(".local/state/schema/endpoint.toml")
+    };
+    Ok(home.join(suffix))
 }
 
-/// Write a per-project `endpoint.toml` pointing at the shared
-/// daemon's URL with the project's path segment and bearer.
-fn write_daemon_endpoint_file(path: &Path, bound: &SocketAddr, slot: &ProjectSlot) -> Result<()> {
+/// Write the daemon's **global** endpoint.toml — one file for the
+/// whole workstation. The URL points at the shared `/mcp` mount
+/// (no per-project path segment under ADR-0027).
+fn write_global_endpoint_file(path: &Path, bound: &SocketAddr, token: &str) -> Result<()> {
     let endpoint = Endpoint {
         version: 1,
-        url: format!("http://{bound}/mcp/{}", slot.project_id),
-        token: slot.token.clone(),
+        url: format!("http://{bound}/mcp"),
+        token: token.to_string(),
         pid: process::id(),
         started_at: Utc::now().to_rfc3339(),
     };
     endpoint.write_atomic(path)?;
-    tracing::info!(
-        project = %slot.project_id,
-        path = %path.display(),
-        "daemon: endpoint.toml written (mode 0600)",
-    );
+    tracing::info!(path = %path.display(), "daemon: global endpoint.toml written (mode 0600)");
     Ok(())
 }
 
