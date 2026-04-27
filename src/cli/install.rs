@@ -199,6 +199,39 @@ pub fn render_mcp_config_fragment(endpoint: &Endpoint) -> String {
     )
 }
 
+/// Render an `mcpServers` snippet pointing at `schema mcp-shim`.
+///
+/// Per ADR-0030, the shim is a stdio MCP server that re-reads the global
+/// `endpoint.toml` on every restart, so the consumer's `.mcp.json` no
+/// longer needs to be regenerated when the daemon rotates its bearer or
+/// port. The bearer never appears in the snippet.
+#[must_use]
+pub fn render_mcp_config_shim_fragment(binary_path: &Path) -> String {
+    let escaped = escape_json_string(&binary_path.to_string_lossy());
+    format!(
+        "  \"schema\": {{\n    \"type\": \"stdio\",\n    \"command\": \"{escaped}\",\n    \"args\": [\"mcp-shim\"]\n  }}"
+    )
+}
+
+fn escape_json_string(raw: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(

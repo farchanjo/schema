@@ -45,8 +45,10 @@ use schema::app::project_instance::{ProjectInstance, spawn_project_watcher};
 use schema::cli::install::{
     DAEMON_LAUNCHD_LABEL, DAEMON_SYSTEMD_UNIT_NAME, DaemonInstallInputs, InstallInputs,
     launchd_label, render_linux_daemon_unit, render_linux_unit, render_macos_daemon_plist,
-    render_macos_plist, render_mcp_config_fragment, systemd_unit_name,
+    render_macos_plist, render_mcp_config_fragment, render_mcp_config_shim_fragment,
+    systemd_unit_name,
 };
+use schema::cli::mcp_shim;
 use schema::ports::{Embedder, LlmProvider, MetadataStore, Persistence};
 
 /// Build the top-level CLI definition using the clap builder API.
@@ -78,7 +80,27 @@ fn cli() -> Command {
         .subcommand(uninstall_subcommand(config_arg.clone()))
         .subcommand(service_subcommand(config_arg.clone()))
         .subcommand(mcp_config_subcommand(config_arg))
+        .subcommand(mcp_shim_subcommand())
         .subcommand(daemon_subcommand())
+}
+
+/// `schema mcp-shim` (ADR-0030).
+///
+/// Stdio ↔ HTTP MCP bridge. Claude Code (or any other MCP client) spawns
+/// this as a `"type": "stdio"` server in `.mcp.json`; the shim reads the
+/// global `endpoint.toml` written by the daemon and forwards JSON-RPC
+/// frames to `POST /mcp` with the bearer injected. On `401` or
+/// `ECONNREFUSED` the shim re-reads `endpoint.toml` once and retries —
+/// absorbing the per-restart token + URL rotation that makes a static
+/// `.mcp.json` rot.
+fn mcp_shim_subcommand() -> Command {
+    Command::new("mcp-shim").about(
+        "Run the stdio ↔ HTTP MCP bridge (ADR-0030). Spawned by an MCP client \
+         (Claude Code, ...) as a `\"type\": \"stdio\"` server. Reads the global \
+         endpoint.toml, forwards JSON-RPC frames to the running daemon, and \
+         re-reads endpoint.toml on 401 or connection failure to absorb \
+         daemon-restart rotation.",
+    )
 }
 
 /// `schema daemon` — start the shared multi-project daemon (ADR-0027).
@@ -235,13 +257,35 @@ fn service_subcommand(config_arg: Arg) -> Command {
         )
 }
 
-/// `schema mcp-config --config X` (ADR-0021 helper).
+/// `schema mcp-config --config X [--shim]` (ADR-0021 + ADR-0030).
 fn mcp_config_subcommand(config_arg: Arg) -> Command {
     Command::new("mcp-config")
         .about(
             "Print the `mcpServers` JSON fragment for the running server, ready to paste into a consumer's `.mcp.json` (ADR-0021).",
         )
         .arg(config_arg)
+        .arg(
+            Arg::new("shim")
+                .long("shim")
+                .action(clap::ArgAction::SetTrue)
+                .help(
+                    "Emit the stdio shim shape (ADR-0030) instead of the direct HTTP shape. \
+                     Recommended: the shim absorbs daemon-restart rotation so .mcp.json does \
+                     not go stale. Without --shim, the legacy direct URL + bearer shape is \
+                     emitted and must be re-pasted after every restart.",
+                ),
+        )
+        .arg(
+            Arg::new("binary-path")
+                .long("binary-path")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help(
+                    "Override the binary path written into the shim shape \
+                     (default: /usr/local/bin/schema per ADR-0014). \
+                     Ignored without --shim.",
+                ),
+        )
 }
 
 async fn run_forget_dispatch(sub: &ArgMatches) -> Result<()> {
@@ -306,7 +350,8 @@ async fn main() -> Result<()> {
                 "unknown `service` subcommand; expected `status`"
             )),
         },
-        Some(("mcp-config", sub)) => run_mcp_config(&config_from(sub)),
+        Some(("mcp-config", sub)) => run_mcp_config_dispatch(sub),
+        Some(("mcp-shim", _)) => run_mcp_shim().await,
         Some(("daemon", _)) => run_daemon().await,
         Some((other, _)) => Err(anyhow::anyhow!("unknown subcommand: {other}")),
         None => run_serve(PathBuf::from("schema.toml")).await,
@@ -934,7 +979,20 @@ fn run_service_status(config: &Path) -> Result<()> {
 /// `--config` argument is still accepted for back-compat with older
 /// muscle memory but ignored; the snippet always describes the
 /// shared daemon endpoint.
-fn run_mcp_config(_config: &Path) -> Result<()> {
+///
+/// With `--shim` (ADR-0030) the snippet emits the stdio shape
+/// pointing at `schema mcp-shim`; the bearer never enters the
+/// consumer file and the wiring survives daemon restarts.
+fn run_mcp_config_dispatch(sub: &ArgMatches) -> Result<()> {
+    if sub.get_flag("shim") {
+        let binary_override = sub.get_one::<PathBuf>("binary-path").cloned();
+        run_mcp_config_shim(binary_override)
+    } else {
+        run_mcp_config_http()
+    }
+}
+
+fn run_mcp_config_http() -> Result<()> {
     let endpoint_path = global_endpoint_path()?;
     let endpoint = Endpoint::load(&endpoint_path).with_context(|| {
         format!(
@@ -944,6 +1002,16 @@ fn run_mcp_config(_config: &Path) -> Result<()> {
         )
     })?;
     let snippet = render_mcp_config_fragment(&endpoint);
+    write_fragment(&snippet)
+}
+
+fn run_mcp_config_shim(binary_override: Option<PathBuf>) -> Result<()> {
+    let binary_path = binary_override.unwrap_or_else(|| PathBuf::from("/usr/local/bin/schema"));
+    let snippet = render_mcp_config_shim_fragment(&binary_path);
+    write_fragment(&snippet)
+}
+
+fn write_fragment(snippet: &str) -> Result<()> {
     let stdout = io::stdout();
     let mut out = stdout.lock();
     writeln!(out, "{{")?;
@@ -952,4 +1020,11 @@ fn run_mcp_config(_config: &Path) -> Result<()> {
     writeln!(out, "  }}")?;
     writeln!(out, "}}")?;
     Ok(())
+}
+
+/// `schema mcp-shim` (ADR-0030). Pure stdio↔HTTP bridge — owns no
+/// state, blocks on stdin until EOF.
+async fn run_mcp_shim() -> Result<()> {
+    let endpoint_path = global_endpoint_path()?;
+    mcp_shim::run(endpoint_path).await
 }
