@@ -431,3 +431,73 @@ pub enum LlmError {
         message: String,
     },
 }
+
+// ─── SecretStore (ADR-0031) ──────────────────────────────────────────────
+
+/// Identifier for a provider whose API key the daemon may need.
+///
+/// Kept as a small enum (rather than `&str`) so the [`SecretStore`]
+/// implementation can match exhaustively and the compiler flags any
+/// future provider that gets added without a corresponding lookup
+/// branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderId {
+    /// Anthropic (`ANTHROPIC_API_KEY` legacy env / `[llm.anthropic]`
+    /// in `secrets.toml`).
+    Anthropic,
+    /// `OpenAI` (`OPENAI_API_KEY` legacy env / `[llm.openai]` in
+    /// `secrets.toml`).
+    OpenAi,
+}
+
+impl ProviderId {
+    /// Stable string identifier used in `tracing` logs and TOML keys.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+            Self::OpenAi => "openai",
+        }
+    }
+}
+
+/// Outbound port for fetching daemon-scope secrets (LLM provider keys).
+///
+/// ADR-0031 introduces this port so the [`LlmProvider`] factory in the
+/// composition root no longer reads `ANTHROPIC_API_KEY` /
+/// `OPENAI_API_KEY` directly from the process environment. The default
+/// adapter ([`crate::adapters::secrets_toml::FileSecretStore`]) reads
+/// a mode-`0600` `secrets.toml` next to the daemon's `endpoint.toml`;
+/// future adapters may consult macOS Keychain or Linux libsecret.
+///
+/// Implementations must:
+/// - return `Ok(None)` when the secret is simply absent (fast path);
+///   never panic or block on missing files
+/// - never log the secret value at any level
+/// - tolerate concurrent re-reads (`SIGHUP`-driven rotation)
+pub trait SecretStore: Send + Sync {
+    /// Look up the API key for `provider`. Returns `Ok(None)` when the
+    /// store is empty / has no entry for that provider; only
+    /// configuration / I/O failures yield `Err`.
+    ///
+    /// # Errors
+    /// Returns an error when the underlying file/keystore is present
+    /// but cannot be parsed or accessed (e.g., wrong file mode,
+    /// unsupported version, permission-denied on Keychain).
+    fn provider_key(&self, provider: ProviderId) -> Result<Option<String>, SecretStoreError>;
+}
+
+#[derive(Debug, Error)]
+pub enum SecretStoreError {
+    #[error("io: {0}")]
+    Io(#[from] io::Error),
+    #[error("toml parse: {0}")]
+    Parse(String),
+    #[error("unsupported secrets.toml version {0} (this build understands version 1)")]
+    UnsupportedVersion(u32),
+    #[error(
+        "secrets.toml has mode {mode:#o} but must be 0600 — \
+         run `chmod 600 {path}` (or re-run `schema secrets migrate`)"
+    )]
+    InsecureMode { path: String, mode: u32 },
+}
