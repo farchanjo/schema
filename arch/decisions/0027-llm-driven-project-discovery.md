@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-04-26
 decision-makers: ["Fabricio Archanjo"]
 review-due: 2026-10-26
@@ -508,3 +508,11 @@ answer to the same question.
   remain on `main` until refactor PRs land; the operator-facing
   deployment still defaults to ADR-0019 per-project units, so
   no production user is affected by the pivot.
+
+- **2026-04-26 — accepted.** Operator reviewed via
+  `/arch-advisor` and confirmed Option B as the direction.
+  Refactor sequence in §"Slice rollback / refactor plan" is
+  the merge gate; the canary fitness function E2E
+  (`tests/e2e/test_adr0027_isolation.py`) flips this from
+  "accepted (impl gated)" to "accepted (live)" once green in
+  CI on the cutover PR.
