@@ -1,0 +1,48 @@
+[package]
+name = "recall"
+description = "Session-transcript retrieval MCP server (stdio) for Claude Code (ADR-0033). Skeleton: only `ping` tool today; the six retrieval verbs land in upcoming commits."
+keywords = ["mcp", "rag", "embeddings", "session", "transcript"]
+categories = ["development-tools", "command-line-utilities"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[[bin]]
+name = "recall"
+path = "src/main.rs"
+
+[dependencies]
+# Shared kernel between schema and recall (ADR-0034). Reserved for the
+# upcoming embedder + chunker wiring; not exercised in the step-3 skeleton.
+schema-core = { path = "../schema-core" }
+
+# MCP — Model Context Protocol Rust SDK (ADR-0033 stdio side).
+# Features required for the recall binary:
+#   server         — server-side handler infrastructure
+#   macros         — #[tool] / #[tool_router] attribute macros
+#   transport-io   — stdio MCP transport (recall is process-per-window,
+#                    spawned by Claude Code via .mcp.json type=stdio)
+rmcp = { version = "1.5", features = ["server", "macros", "transport-io"] }
+
+# Async runtime
+tokio = { version = "1.52", features = ["full"] }
+
+# CLI (subcommands: mcp-server today; recall, query, files, ... later)
+clap = { version = "4", features = ["derive"] }
+
+# Error handling
+anyhow = "1"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+
+# Logging — to stderr only, never stdout (stdio JSON-RPC frames go on stdout)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[lints]
+workspace = true

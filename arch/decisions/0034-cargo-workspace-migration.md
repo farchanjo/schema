@@ -422,6 +422,31 @@ path = "src/main.rs"
 
 ## Evidence and amendments
 
+- **2026-04-27 — commit 3 landed.** New binary crate
+  `crates/recall/` ships the ADR-0033 skeleton: a clap CLI with a
+  single `mcp-server` subcommand running an rmcp stdio server
+  that registers exactly one tool (`ping` returning `"pong"`).
+  Pulls `schema-core = { path = "../schema-core" }` (reserved for
+  the embedder + chunker wiring in upcoming commits) and
+  `rmcp = { features = ["server", "macros", "transport-io"] }`.
+  Logs go to stderr only via `tracing-subscriber` — stdio
+  JSON-RPC frames live on stdout. Composition root is
+  `crates/recall/src/main.rs#run_mcp_server` calling
+  `RecallServer.serve(stdio()).await`. Inherits the ADR-0012
+  strict lint baseline via `[lints] workspace = true`. The
+  smoke test (`crates/recall/tests/smoke.rs`) currently
+  validates only that the bin target compiles; the full
+  `initialize` → `notifications/initialized` → `tools/list`
+  round-trip lands in the next commit when the six retrieval
+  verbs go in and the test infrastructure for piped JSON-RPC
+  is worth its weight. End-to-end manual smoke against the
+  built debug binary confirms `tools/list` returns the
+  registered `ping` tool. Validation gate green: 140 tests
+  (139 from schema, 1 new from recall — net +1 vs step 2).
+  ADR-0034 migration is complete; ADR-0033 implementation can
+  proceed in subsequent commits without further workspace
+  shape changes.
+
 - **2026-04-27 — commit 2 landed.** New library crate
   `crates/schema-core/` carries the shared kernel:
   `embedder::{Embedder, EmbedError, EMBEDDER_QUERY_PREFIX,
