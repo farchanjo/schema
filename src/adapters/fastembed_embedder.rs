@@ -22,7 +22,7 @@ use tokio::task;
 use tracing::{debug, info};
 
 use crate::adapters::project_identity::cache_root;
-use crate::ports::{EmbedError, Embedder};
+use crate::ports::{EMBEDDER_PASSAGE_PREFIX, EMBEDDER_QUERY_PREFIX, EmbedError, Embedder};
 
 /// Output dimension of BGE-M3.
 pub const BGE_M3_DIMENSIONS: usize = 1024;
@@ -44,6 +44,13 @@ pub enum EmbedderError {
 /// Construction triggers the model download on first run; subsequent
 /// constructions reuse the cached model file. Wrapped in an `Option` so the
 /// async trait impl can move the model into `spawn_blocking` and put it back.
+///
+/// The `with_prefix` flag is threaded through at call time (ADR-0029)
+/// rather than held by the adapter, so the daemon's single shared
+/// embedder (ADR-0026) faithfully serves projects whose flag values
+/// diverge. When `with_prefix` is `false` the adapter routes raw text
+/// through to the model (status quo); when `true` it prepends the BAAI
+/// bge-m3 query / passage prefix matching the call.
 pub struct FastembedEmbedder {
     model: Option<TextEmbedding>,
 }
@@ -82,11 +89,12 @@ impl FastembedEmbedder {
         debug!("bge-m3 embedder ready");
         Ok(Self { model: Some(model) })
     }
-}
 
-#[async_trait]
-impl Embedder for FastembedEmbedder {
-    async fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
+    /// Run a batch through the underlying fastembed model on the
+    /// blocking pool. Single helper used by both [`Self::embed_query`]
+    /// and [`Self::embed_passages`] so the `spawn_blocking` plumbing
+    /// has one home.
+    async fn embed_blocking(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -106,6 +114,44 @@ impl Embedder for FastembedEmbedder {
         self.model = Some(model);
 
         outcome.map_err(|e| EmbedError::Backend(format!("{e}")))
+    }
+}
+
+#[async_trait]
+impl Embedder for FastembedEmbedder {
+    async fn embed_query(
+        &mut self,
+        text: String,
+        with_prefix: bool,
+    ) -> Result<Vec<f32>, EmbedError> {
+        let prepared = if with_prefix {
+            format!("{EMBEDDER_QUERY_PREFIX}{text}")
+        } else {
+            text
+        };
+        let mut vectors = self.embed_blocking(vec![prepared]).await?;
+        vectors
+            .pop()
+            .ok_or_else(|| EmbedError::Backend("fastembed returned no vector".to_string()))
+    }
+
+    async fn embed_passages(
+        &mut self,
+        texts: Vec<String>,
+        with_prefix: bool,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let prepared = if with_prefix {
+            texts
+                .into_iter()
+                .map(|t| format!("{EMBEDDER_PASSAGE_PREFIX}{t}"))
+                .collect()
+        } else {
+            texts
+        };
+        self.embed_blocking(prepared).await
     }
 }
 
