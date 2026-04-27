@@ -28,6 +28,7 @@ use std::sync::Once;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use rusqlite::OptionalExtension;
 use rusqlite::ffi::{sqlite3, sqlite3_api_routines, sqlite3_auto_extension};
 use rusqlite::{Connection, params};
 use tokio::sync::Mutex;
@@ -237,15 +238,126 @@ const DDL_VEC_TRIGGER: &str = "
     END;
 ";
 
+/// Single-row scalar table tracking storage-format invariants that must
+/// outlive the process (ADR-0028 partition migration, ADR-0029 prefix
+/// recipe). One row per `key`.
+const DDL_META: &str = "
+    CREATE TABLE IF NOT EXISTS meta (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    );
+";
+
+/// `meta.key` storing the storage-schema version. Bumped whenever the
+/// physical layout of `chunks_vec` changes (e.g., partition column
+/// added, ANN index introduced). The adapter compares the stored value
+/// against [`STORAGE_SCHEMA_VERSION_CURRENT`] at `ensure_ready` time
+/// and runs any mechanical migrations needed.
+const META_KEY_SCHEMA_VERSION: &str = "schema_version";
+
+/// `meta.key` recording which embedding recipe (ADR-0029) the rows in
+/// `chunks_vec` were produced under. Values: [`RECIPE_RAW`] or
+/// [`RECIPE_BGE_M3_QUERY_PASSAGE`]. Mismatch with the project's
+/// `query_passage_prefix` flag triggers a forced re-embed from the
+/// scalar `chunks` table on the next start.
+const META_KEY_EMBEDDING_RECIPE: &str = "embedding_recipe";
+
+/// Storage-schema versions. v1 — pre-ADR-0028 (no partition key).
+/// v2 — ADR-0028 (kind partition key on `chunks_vec`).
+const STORAGE_SCHEMA_VERSION_V1: &str = "1";
+const STORAGE_SCHEMA_VERSION_V2: &str = "2";
+
+/// Current storage-schema version this binary writes. Older `store.db`
+/// files are migrated up to this on first start; downgrades are not
+/// supported.
+const STORAGE_SCHEMA_VERSION_CURRENT: &str = STORAGE_SCHEMA_VERSION_V2;
+
+/// Embedding-recipe markers (ADR-0029).
+pub const RECIPE_RAW: &str = "raw";
+pub const RECIPE_BGE_M3_QUERY_PASSAGE: &str = "bge-m3-query-passage";
+
+/// Build the `chunks_vec` virtual-table DDL for the current storage
+/// schema (v2 — kind partition key per ADR-0028).
+fn chunks_vec_ddl(vector_dim: u32) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(\
+            embedding float[{vector_dim}],\
+            kind text partition key\
+         );"
+    )
+}
+
 /// DDL fan-out across the three tables and their triggers.
 fn ensure_schema(c: &Connection, vector_dim: u32) -> Result<(), PersistenceError> {
     c.execute_batch(DDL_CHUNKS).map_err(sqlite_err)?;
-    let vec_ddl = format!(
-        "CREATE VIRTUAL TABLE IF NOT EXISTS chunks_vec USING vec0(embedding float[{vector_dim}]);"
-    );
-    c.execute_batch(&vec_ddl).map_err(sqlite_err)?;
+    c.execute_batch(DDL_META).map_err(sqlite_err)?;
+    c.execute_batch(&chunks_vec_ddl(vector_dim))
+        .map_err(sqlite_err)?;
     c.execute_batch(DDL_FTS_TRIGGERS).map_err(sqlite_err)?;
     c.execute_batch(DDL_VEC_TRIGGER).map_err(sqlite_err)?;
+    Ok(())
+}
+
+/// Read `meta(key)` if present.
+fn read_meta(conn: &Connection, key: &str) -> Result<Option<String>, PersistenceError> {
+    let mut stmt = conn
+        .prepare("SELECT value FROM meta WHERE key = ?1")
+        .map_err(sqlite_err)?;
+    let value: Option<String> = stmt
+        .query_row(params![key], |row| row.get::<_, String>(0))
+        .optional()
+        .map_err(sqlite_err)?;
+    Ok(value)
+}
+
+/// Upsert `meta(key, value)`.
+fn write_meta(conn: &Connection, key: &str, value: &str) -> Result<(), PersistenceError> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2) \
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )
+    .map_err(sqlite_err)?;
+    Ok(())
+}
+
+/// Detect whether `chunks_vec` already has the v2 partition column
+/// (`kind`). Older `store.db` files (v1) have only the `embedding`
+/// column. Inspecting `PRAGMA table_xinfo(chunks_vec)` is the most
+/// reliable probe — `sqlite-vec` virtual tables expose their schema
+/// through the standard pragma.
+fn chunks_vec_has_kind_partition(conn: &Connection) -> Result<bool, PersistenceError> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM pragma_table_xinfo('chunks_vec')")
+        .map_err(sqlite_err)?;
+    let mut rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(sqlite_err)?;
+    let has_kind = rows.try_fold(false, |acc, r| match r {
+        Ok(name) => Ok::<_, PersistenceError>(acc || name == "kind"),
+        Err(e) => Err(sqlite_err(e)),
+    })?;
+    Ok(has_kind)
+}
+
+/// Migrate `chunks_vec` from v1 (no partition) to v2 (kind partition
+/// key). Drop + recreate the virtual table and replay every row from
+/// scalar `chunks` using its existing rowid + kind. The per-row
+/// embedding is **not** carried over by this migration — v1 stored it
+/// only inside `chunks_vec` (no on-row blob) so the v1 → v2 step
+/// produces an empty vec table that the daemon must repopulate from
+/// fresh embeddings (delta-sync after migration). This is the
+/// trade-off recorded in ADR-0028 §"Schema migration": data loss is
+/// limited to vectors, never to the canonical `chunks` rows.
+fn migrate_chunks_vec_to_v2(conn: &Connection, vector_dim: u32) -> Result<(), PersistenceError> {
+    info!("migrating chunks_vec to v2 (kind partition key) per ADR-0028");
+    conn.execute_batch("DROP TABLE IF EXISTS chunks_vec")
+        .map_err(sqlite_err)?;
+    conn.execute_batch(&chunks_vec_ddl(vector_dim))
+        .map_err(sqlite_err)?;
+    // The vec-delete trigger references chunks_vec; re-bind it
+    // explicitly in case the DROP cascaded the trigger as well.
+    conn.execute_batch(DDL_VEC_TRIGGER).map_err(sqlite_err)?;
     Ok(())
 }
 
@@ -292,6 +404,30 @@ impl Persistence for SqliteVecStore {
         let dim = u32::try_from(BGE_M3_DIMENSIONS)
             .map_err(|e| PersistenceError::Backend(format!("dim cast: {e}")))?;
         let guard = self.conn.lock().await;
+        // Ensure the `meta` and `chunks` tables exist before reading
+        // them — a fresh store.db has neither.
+        guard.execute_batch(DDL_CHUNKS).map_err(sqlite_err)?;
+        guard.execute_batch(DDL_META).map_err(sqlite_err)?;
+
+        // Migrate `chunks_vec` from v1 → v2 if needed (ADR-0028).
+        let stored_version = read_meta(&guard, META_KEY_SCHEMA_VERSION)?.unwrap_or_else(|| {
+            // Absent meta row means either a brand-new store.db
+            // (no chunks_vec yet) or a pre-meta v1 store. The
+            // partition probe disambiguates.
+            STORAGE_SCHEMA_VERSION_V1.to_string()
+        });
+        if stored_version != STORAGE_SCHEMA_VERSION_CURRENT
+            || !chunks_vec_has_kind_partition(&guard)?
+        {
+            migrate_chunks_vec_to_v2(&guard, dim)?;
+            write_meta(
+                &guard,
+                META_KEY_SCHEMA_VERSION,
+                STORAGE_SCHEMA_VERSION_CURRENT,
+            )?;
+        }
+
+        // Schema fan-out is idempotent for everything else.
         ensure_schema(&guard, dim)?;
         drop(guard);
         info!("sqlite-vec schema ensured");
@@ -336,12 +472,13 @@ impl Persistence for SqliteVecStore {
         vector: &[f32],
         k: usize,
         kind_filter: Option<&str>,
+        min_score: Option<f32>,
     ) -> Result<Vec<ChunkRecord>, PersistenceError> {
         let bytes = vector_to_bytes(vector);
         let limit = i64::try_from(k).unwrap_or(i64::MAX);
         let kind_owned = kind_filter.map(str::to_string);
         let guard = self.conn.lock().await;
-        let rows = run_query_nearest(&guard, &bytes, limit, kind_owned.as_deref())?;
+        let rows = run_query_nearest(&guard, &bytes, limit, kind_owned.as_deref(), min_score)?;
         drop(guard);
         Ok(rows)
     }
@@ -410,6 +547,20 @@ impl Persistence for SqliteVecStore {
         );
         Ok(())
     }
+
+    async fn read_embedding_recipe(&self) -> Result<Option<String>, PersistenceError> {
+        let guard = self.conn.lock().await;
+        let value = read_meta(&guard, META_KEY_EMBEDDING_RECIPE)?;
+        drop(guard);
+        Ok(value)
+    }
+
+    async fn write_embedding_recipe(&self, recipe: &str) -> Result<(), PersistenceError> {
+        let guard = self.conn.lock().await;
+        write_meta(&guard, META_KEY_EMBEDDING_RECIPE, recipe)?;
+        drop(guard);
+        Ok(())
+    }
 }
 
 /// Bulk-delete every row in `chunks` and reclaim disk pages with `VACUUM`.
@@ -432,7 +583,7 @@ const SQL_INSERT_CHUNK: &str = "INSERT INTO chunks (id, source_path, line_start,
                                 artifact_id, title, kind, content) \
                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)";
 
-const SQL_INSERT_VEC: &str = "INSERT INTO chunks_vec (rowid, embedding) VALUES (?1, ?2)";
+const SQL_INSERT_VEC: &str = "INSERT INTO chunks_vec (rowid, embedding, kind) VALUES (?1, ?2, ?3)";
 
 fn insert_one_row(
     tx: &rusqlite::Transaction<'_>,
@@ -454,7 +605,7 @@ fn insert_one_row(
         .map_err(sqlite_err)?;
     let rowid = tx.last_insert_rowid();
     insert_vec
-        .execute(params![rowid, row.vector_bytes])
+        .execute(params![rowid, row.vector_bytes, row.kind])
         .map_err(sqlite_err)?;
     Ok(())
 }
@@ -486,26 +637,41 @@ fn execute_deletes(conn: &mut Connection, paths: &[String]) -> Result<(), Persis
     Ok(())
 }
 
+fn build_query_nearest_sql(kind_filter: Option<&str>, min_score: Option<f32>) -> String {
+    let cols = prefixed_columns();
+    let kind_clause = if kind_filter.is_some() {
+        // Pushed inside the MATCH via the kind partition key — sqlite-vec
+        // routes the search to the partition before evaluating top-K.
+        "AND v.kind = ?3"
+    } else {
+        ""
+    };
+    // ADR-0028 score floor: cosine distance ceiling = 1.0 - min_score.
+    // Inlined as a literal — `f32` renders a finite, SQL-safe number;
+    // this avoids an extra parameter slot whose ordinal would clash
+    // with the optional kind bind.
+    let distance_clause = min_score.map_or_else(String::new, |s| {
+        let max_distance = 1.0_f32 - s;
+        format!(" AND v.distance <= {max_distance}")
+    });
+    format!(
+        "SELECT {cols}, v.distance \
+         FROM chunks_vec v \
+         JOIN chunks c ON c.rowid = v.rowid \
+         WHERE v.embedding MATCH ?1 AND k = ?2 \
+         {kind_clause}{distance_clause} \
+         ORDER BY v.distance"
+    )
+}
+
 fn run_query_nearest(
     conn: &Connection,
     vector_bytes: &[u8],
     k: i64,
     kind_filter: Option<&str>,
+    min_score: Option<f32>,
 ) -> Result<Vec<ChunkRecord>, PersistenceError> {
-    let cols = prefixed_columns();
-    let kind_clause = if kind_filter.is_some() {
-        "AND c.kind = ?3"
-    } else {
-        ""
-    };
-    let sql = format!(
-        "SELECT {cols}, v.distance \
-         FROM chunks_vec v \
-         JOIN chunks c ON c.rowid = v.rowid \
-         WHERE v.embedding MATCH ?1 AND k = ?2 \
-         {kind_clause} \
-         ORDER BY v.distance"
-    );
+    let sql = build_query_nearest_sql(kind_filter, min_score);
     let mut stmt = conn.prepare(&sql).map_err(sqlite_err)?;
     let rows = if let Some(kind) = kind_filter {
         stmt.query_map(params![vector_bytes, k, kind], map_with_distance)
@@ -726,7 +892,7 @@ mod tests {
         let vectors = vec![near_vec.clone(), far_vec];
         store.append_chunks(&chunks, &vectors).await.unwrap();
 
-        let hits = store.query_nearest(&near_vec, 2, None).await.unwrap();
+        let hits = store.query_nearest(&near_vec, 2, None, None).await.unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0].source_path, "near.md");
         assert_eq!(hits[1].source_path, "far.md");
@@ -795,7 +961,10 @@ mod tests {
         store.append_chunks(&chunks, &vectors).await.unwrap();
 
         let started = Instant::now();
-        let hits = store.query_nearest(&query_vec, 8, None).await.unwrap();
+        let hits = store
+            .query_nearest(&query_vec, 8, None, None)
+            .await
+            .unwrap();
         let elapsed = started.elapsed();
 
         tracing::info!(
@@ -871,7 +1040,7 @@ mod tests {
             .unwrap();
 
         // vec0 path — exercised through the Persistence port.
-        let vec_hits = store.query_nearest(&vector, 1, None).await.unwrap();
+        let vec_hits = store.query_nearest(&vector, 1, None, None).await.unwrap();
         assert_eq!(vec_hits.len(), 1);
         assert_eq!(vec_hits[0].source_path, "rbac.md");
 
