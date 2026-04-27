@@ -500,3 +500,21 @@ diving into the rmcp source.
   until then ADR-0019's per-project process model continues
   to run in production. See ADR-0026 §"Decision" and
   ADR-0026 §"Cross-references and follow-ups".
+
+- **2026-04-27 — process-shape part further amended by ADR-0027.**
+  ADR-0026's URL-path routing (one `nest_service`
+  `/mcp/<project_id>` per project, per-mount bearer) is itself
+  superseded by ADR-0027's single `/mcp` mount + single
+  workstation bearer + per-tool `working_directory` parameter.
+  Transport (Streamable HTTP via rmcp 1.5 + axum 0.8,
+  `LocalSessionManager`, `with_stateful_mode(true)`,
+  localhost-only allowed hosts, SIGTERM drain) and bearer
+  auth shape are unchanged from this ADR's original scope;
+  what changes is project membership (now LLM-driven via
+  `working_directory` instead of operator-curated via a
+  registry). ADR-0019's "one server per project" framing
+  remains the right mental model for the **stores and
+  watchers**, which still stay one-per-project inside the
+  shared daemon — what shrunk is the URL-and-token surface
+  (one URL, one token, N projects). See ADR-0027 §"Decision"
+  and ADR-0027 §"Slice rollback / refactor plan".

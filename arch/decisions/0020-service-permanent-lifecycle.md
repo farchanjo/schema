@@ -373,3 +373,19 @@ fitness function is **split** between CI and local validation:
   ADR-0026 fitness function; until then the per-project units
   installed under ADR-0020 stay live. See ADR-0026 §"Decision"
   and ADR-0026 §"Cross-references".
+
+- **2026-04-27 — per-project shape further amended by ADR-0027.**
+  ADR-0026's `schema project register / unregister / list`
+  verbs + operator-curated `registry.toml` are themselves
+  superseded by ADR-0027's directory-as-source-of-truth.
+  Project membership becomes implicit: every MCP tool call
+  carries a `working_directory` parameter the daemon walks up
+  to find `schema.toml`, then lazy-wires the
+  `ProjectInstance` and caches it for the daemon's lifetime.
+  No registry file, no register verb. The launchd / systemd
+  unit shape collapses further to a single workstation-level
+  unit invoking `schema daemon` (no `--config` flag, no per-
+  project labels). ADR-0014, ADR-0008 unaffected — the cache
+  directory layout and codesign procedure carry over. See
+  ADR-0027 §"Decision" and ADR-0027 §"Slice rollback / refactor
+  plan".

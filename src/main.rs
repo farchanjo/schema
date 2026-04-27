@@ -17,7 +17,6 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -34,7 +33,6 @@ use uuid::Uuid;
 use schema::adapters::anthropic_provider::AnthropicProvider;
 use schema::adapters::endpoint_toml::Endpoint;
 use schema::adapters::fastembed_embedder::FastembedEmbedder;
-use schema::adapters::filesystem::NotifyWatcher;
 use schema::adapters::mcp_server::{SchemaServer, build_router};
 use schema::adapters::metadata_store::TomlMetadataStore;
 use schema::adapters::openai_provider::OpenAiProvider;
@@ -43,16 +41,12 @@ use schema::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_di
 use schema::adapters::toml_config::SchemaConfig;
 use schema::app::cleanup::Cleanup;
 use schema::app::daemon::Daemon;
-use schema::app::delta_sync::{DeltaSync, corpus_paths_from_config};
-use schema::app::project_instance::ProjectInstance;
-use schema::app::watcher_consumer::run_watcher_consumer;
+use schema::app::project_instance::{ProjectInstance, spawn_project_watcher};
 use schema::cli::install::{
     InstallInputs, launchd_label, render_linux_unit, render_macos_plist,
     render_mcp_config_fragment, systemd_unit_name,
 };
-use schema::ports::{Embedder, LlmProvider, MetadataStore, Persistence, Watcher};
-
-const WATCHER_DEBOUNCE: Duration = Duration::from_millis(500);
+use schema::ports::{Embedder, LlmProvider, MetadataStore, Persistence};
 
 /// Build the top-level CLI definition using the clap builder API.
 ///
@@ -86,18 +80,20 @@ fn cli() -> Command {
         .subcommand(daemon_subcommand())
 }
 
-/// `schema daemon` — start the shared multi-project daemon (ADR-0026).
+/// `schema daemon` — start the shared multi-project daemon (ADR-0027).
 ///
-/// Reads the project registry from `Registry::default_path()`, wires
-/// every project against one shared `Embedder`, binds one localhost
-/// port, and serves `/mcp/<project_id>` for every registered project.
-/// No `--config` flag — project membership is the registry's job per
-/// ADR-0026 amendment to ADR-0020.
+/// Single `/mcp` mount, single workstation bearer. Project membership
+/// is implicit and lazy: every retrieval / cleanup / synthesize tool
+/// call carries a `working_directory` parameter the daemon walks up
+/// to find a `schema.toml`, then wires the project on first request
+/// and caches it for the daemon's lifetime. No `--config` flag and no
+/// operator-curated registry (ADR-0027 supersedes ADR-0026's
+/// `schema project register / unregister / list`).
 fn daemon_subcommand() -> Command {
     Command::new("daemon").about(
-        "Start the shared multi-project MCP daemon (ADR-0026). Reads the project registry from \
-         the platform-default path; mounts /mcp/<project_id> for every registered project, gated \
-         by per-project bearer tokens.",
+        "Start the shared multi-project MCP daemon (ADR-0027). Single /mcp mount + single \
+         workstation bearer. Project membership is lazy — every tool call carries a \
+         working_directory parameter the daemon walks up to find schema.toml.",
     )
 }
 
@@ -328,7 +324,7 @@ async fn run_serve(config: PathBuf) -> Result<()> {
     let project = ProjectInstance::wire(cfg, identity, &embedder, llm_provider.clone()).await?;
     let initial = project.sync.run().await?;
     tracing::info!(?initial, "initial delta-sync complete");
-    spawn_watcher(&project.config, &project.identity, project.sync.clone())?;
+    spawn_project_watcher(&project)?;
     let endpoint_path = project.identity.cache_dir.join("endpoint.toml");
     let daemon = Arc::new(Daemon::new_pre_wired(embedder, llm_provider, project));
     let server = SchemaServer::with_daemon(daemon);
@@ -537,27 +533,6 @@ fn cleanup_endpoint_file(path: &Path) {
     } else {
         tracing::info!(path = %path.display(), "endpoint.toml removed on shutdown");
     }
-}
-
-/// Wire the in-session filesystem watcher (ADR-0010 + ADR-0007 evidence
-/// 2026-04-25): debounce `CorpusEvent`s and trigger delta-syncs on each batch.
-fn spawn_watcher(cfg: &SchemaConfig, identity: &ProjectIdentity, sync: DeltaSync) -> Result<()> {
-    let watch_paths = corpus_paths_from_config(cfg, &identity.root);
-    let watcher: Box<dyn Watcher> = Box::new(NotifyWatcher::new(watch_paths.clone()));
-    let (keep_alive, events) = watcher.start()?;
-
-    tokio::spawn(async move {
-        // Move the keep-alive into this task so the underlying notify
-        // watcher lives as long as the consumer.
-        let _watcher_alive = keep_alive;
-        run_watcher_consumer(sync, WATCHER_DEBOUNCE, events).await;
-    });
-    tracing::info!(
-        debounce_ms = u64::try_from(WATCHER_DEBOUNCE.as_millis()).unwrap_or(u64::MAX),
-        watched_paths = watch_paths.len(),
-        "in-session watcher consumer spawned",
-    );
-    Ok(())
 }
 
 fn run_validate(config: &Path) -> Result<()> {

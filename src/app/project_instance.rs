@@ -34,21 +34,28 @@
 
 use std::fmt;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use tokio::sync::Mutex;
 
-use crate::adapters::filesystem::WalkdirWalker;
+use crate::adapters::filesystem::{NotifyWatcher, WalkdirWalker};
 use crate::adapters::markdown_chunker::MarkdownChunker;
 use crate::adapters::metadata_store::TomlMetadataStore;
 use crate::adapters::project_identity::ProjectIdentity;
 use crate::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_dir};
 use crate::adapters::toml_config::SchemaConfig;
 use crate::app::cleanup::Cleanup;
-use crate::app::delta_sync::DeltaSync;
+use crate::app::delta_sync::{DeltaSync, corpus_paths_from_config};
 use crate::app::query::Query;
 use crate::app::synthesize::Synthesize;
-use crate::ports::{Chunker, Embedder, LlmProvider, MetadataStore, Persistence, Walker};
+use crate::app::watcher_consumer::run_watcher_consumer;
+use crate::ports::{Chunker, Embedder, LlmProvider, MetadataStore, Persistence, Walker, Watcher};
+
+/// Watcher debounce window — matches the value `main::WATCHER_DEBOUNCE`
+/// used by the single-project ADR-0019 path so both deployment shapes
+/// pick up edits identically.
+const WATCHER_DEBOUNCE: Duration = Duration::from_millis(500);
 
 /// One registered project's complete runtime state.
 ///
@@ -118,6 +125,40 @@ impl ProjectInstance {
             synthesize: use_cases.synthesize,
         }
     }
+}
+
+/// Wire the in-session filesystem watcher for one project (ADR-0010 +
+/// ADR-0007 evidence 2026-04-25).
+///
+/// Debounces `CorpusEvent`s and triggers delta-syncs on each batch.
+/// Lives in the application layer so both the single-project
+/// `schema serve` (ADR-0019) and the shared-daemon `schema daemon`
+/// (ADR-0027) wire it through the same code path. The
+/// `tokio::spawn`ed consumer holds the watcher's keep-alive guard
+/// for as long as it runs.
+///
+/// # Errors
+/// Returns an error if the watcher backend (`notify`-kqueue on
+/// macOS, inotify on Linux) cannot start watching one of the
+/// resolved corpus paths.
+pub fn spawn_project_watcher(project: &ProjectInstance) -> Result<()> {
+    let watch_paths = corpus_paths_from_config(&project.config, &project.identity.root);
+    let watcher: Box<dyn Watcher> = Box::new(NotifyWatcher::new(watch_paths.clone()));
+    let (keep_alive, events) = watcher.start()?;
+    let sync = project.sync.clone();
+    tokio::spawn(async move {
+        // Move the keep-alive into this task so the underlying
+        // `notify` watcher lives as long as the consumer.
+        let _watcher_alive = keep_alive;
+        run_watcher_consumer(sync, WATCHER_DEBOUNCE, events).await;
+    });
+    tracing::info!(
+        project = %project.identity.id,
+        debounce_ms = u64::try_from(WATCHER_DEBOUNCE.as_millis()).unwrap_or(u64::MAX),
+        watched_paths = watch_paths.len(),
+        "in-session watcher consumer spawned",
+    );
+    Ok(())
 }
 
 impl fmt::Debug for ProjectInstance {
