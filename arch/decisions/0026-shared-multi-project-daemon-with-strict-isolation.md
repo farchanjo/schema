@@ -516,6 +516,70 @@ e2e job.
   the production model. Cutover (per
   `arch/operations/runbook.md` "Migration to ADR-0026")
   is gated on slice 6 turning green in CI.
+
+- **2026-04-26 — slice 4 landed (PR #4, this commit).**
+  `Daemon` aggregator + multi-tenant `axum` router
+  shipped in `src/app/daemon.rs` + `src/adapters/mcp_server.rs`.
+  Per-request runtime not wired yet (see follow-up
+  list); the routing topology and isolation contract
+  are in place.
+  - `src/adapters/mcp_server.rs`: `Mount` struct +
+    `build_multi_tenant_router(mounts, &cancellation)`
+    helper. One `nest_service("/mcp/<project_id>", …)`
+    per project (B.1 routing per ADR-0026 §"Decision");
+    each mount gated by a single-token
+    [`crate::adapters::auth::BearerValidator`] tied to
+    that project's bearer. Empty `mounts` produces a
+    `/health`-only router. `build_router` (single-tenant
+    ADR-0019 path) preserved untouched.
+  - `src/app/daemon.rs`: `Daemon` struct + `Daemon::wire`
+    factory taking a `Registry`, the shared `Embedder`,
+    and the optional shared `LlmProvider`. For each
+    `ProjectEntry`: resolves config + identity, calls
+    `ProjectInstance::wire` with the **shared**
+    `Embedder` (`Arc::clone`), mints a fresh UUIDv4
+    bearer, builds the per-project `SchemaServer`. The
+    `Daemon::into_router` consumer-by-value method moves
+    every slot's server into a `Mount` and delegates to
+    `build_multi_tenant_router`. Sequential project
+    wiring; parallel wiring deferred until ONNX session
+    contention is measured (open question in §"Open
+    questions").
+  - **Routing-vs-validator decision recorded in module
+    docs of `src/app/daemon.rs`.** ADR-0021 amendment
+    by ADR-0026 sketches a `Map<TokenHash, ProjectId>`
+    validator. Slice 4 ships a stricter variant:
+    single-token `BearerValidator` per mount, each
+    accepting **only** that project's token. Effect is
+    the same — bearer-A on `/mcp/<project_b_id>` returns
+    401 — but isolation is by routing construction
+    instead of by predicate. `MultiTenantBearerValidator`
+    + `ProjectTokenRegistry` (slice 1) remain in tree
+    as the daemon's introspection surface (token
+    rotation, future hot-reload admin endpoint), not as
+    the per-request gate. The ADR-0021 amendment text
+    still applies to any future request path that does
+    NOT use B.1 routing.
+  - 3 unit tests added (107 → 110): empty-daemon
+    `/health`, empty-daemon 404 on `/mcp/...`, and
+    `len`/`is_empty` reflecting an empty registry.
+    Strict-lint gate green; `cargo fmt --all -- --check`
+    clean. Real-`Embedder` paths exercised end-to-end in
+    slice 6's canary E2E (which gates merge of the
+    cutover commit).
+  - Follow-ups still pending before cutover:
+    - **Slice 4b**: `schema daemon` CLI verb, HTTP
+      listener wiring, per-project `endpoint.toml`
+      writes pointing at the shared URL with the
+      project's token, watcher loop per slot.
+    - **Slice 5**: launchd / systemd template collapse
+      — `{project_id}` slot removal, workstation-level
+      unit per ADR-0020 amendment.
+    - **Slice 6**: `tests/e2e/test_adr0026_isolation.py`
+      canary fitness function (ALPHA-CANARY /
+      BETA-CANARY) — the **merge gate** for any commit
+      that flips the operator-facing path from ADR-0019
+      per-project to ADR-0026 shared.
 - **2026-04-26 — diagnostic that motivated this ADR.**
   Four daemons resident on the operator's box per
   `vmmap --summary`:

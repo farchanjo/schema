@@ -19,6 +19,7 @@
 //!   - `reset_index`        DESTRUCTIVE — wipe index + manifest (ADR-0015)
 //!   - `forget_source`      DESTRUCTIVE — drop one source path (ADR-0015)
 
+use std::fmt;
 use std::iter;
 use std::sync::Arc;
 use std::time::Duration;
@@ -651,4 +652,105 @@ pub fn build_router(
             header::AUTHORIZATION,
         )))
         .layer(TraceLayer::new_for_http())
+}
+
+/// One project's mount inside the shared-daemon router (ADR-0026).
+///
+/// Each [`Mount`] becomes a `nest_service("/mcp/<project_id>", ...)`
+/// gated by a single-token [`BearerValidator`]. The token is the
+/// project's own — built by [`crate::app::daemon::Daemon::wire`] at
+/// startup and rotated per daemon restart per ADR-0021.
+#[derive(Clone)]
+pub struct Mount {
+    /// Stable project identifier — becomes the URL path segment.
+    pub project_id: String,
+    /// The project's bearer token. Single-token validator at this
+    /// mount accepts only this string; mismatched tokens (other
+    /// projects' or unknown) hit 401, even when the URL path is
+    /// well-formed. This is the ADR-0026 §"Decision drivers"
+    /// "provable per-project isolation at query time" contract.
+    pub token: String,
+    /// The per-project `SchemaServer` whose handlers wrap that
+    /// project's `Query` / `Cleanup` / `Synthesize` use cases.
+    pub server: SchemaServer,
+}
+
+impl fmt::Debug for Mount {
+    /// Manual `Debug` impl — `SchemaServer` does not implement
+    /// `Debug` (its rmcp-derived inner type forbids derive), and the
+    /// bearer `token` is sensitive (per ADR-0021 it must never reach
+    /// structured logs). Surface only the `project_id`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Mount")
+            .field("project_id", &self.project_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Compose the shared-daemon `axum::Router` (ADR-0026 slice 4).
+///
+/// Layout:
+/// - `GET /health` — unauthenticated liveness probe (one global).
+/// - `POST /mcp/<project_id>` — one `nest_service` per project,
+///   each gated by a single-token [`BearerValidator`] tied to
+///   that project's bearer. The token validator's exclusivity
+///   provides the cross-project isolation: a request bearing
+///   project A's token at `/mcp/<project_b_id>` returns 401 from
+///   the validator, never reaching project B's `SchemaServer`.
+///
+/// Cross-cutting layers (applied at the root, so trace spans cover
+/// `/health` too):
+/// - [`SetSensitiveRequestHeadersLayer`] keeps `Authorization` out
+///   of the trace logs.
+/// - [`TraceLayer::new_for_http`] emits one `tracing` span per
+///   request.
+///
+/// `cancellation_token` is shared across every mount so a single
+/// SIGTERM drains all in-flight sessions in parallel.
+///
+/// An empty `mounts` list produces a router with only `/health`.
+/// Useful as a degenerate-case fixture in tests and as the daemon
+/// startup state before any project is registered.
+pub fn build_multi_tenant_router(
+    mounts: Vec<Mount>,
+    cancellation_token: &CancellationToken,
+) -> Router {
+    info!(
+        project_count = mounts.len(),
+        "building multi-tenant HTTP MCP router (ADR-0026)"
+    );
+
+    let mut router = Router::new();
+    for mount in mounts {
+        router = router.merge(per_project_router(mount, cancellation_token.clone()));
+    }
+
+    router
+        .route("/health", get(health_handler))
+        .layer(SetSensitiveRequestHeadersLayer::new(iter::once(
+            header::AUTHORIZATION,
+        )))
+        .layer(TraceLayer::new_for_http())
+}
+
+fn per_project_router(mount: Mount, cancellation_token: CancellationToken) -> Router {
+    let config = StreamableHttpServerConfig::default()
+        .with_cancellation_token(cancellation_token)
+        .with_sse_keep_alive(Some(Duration::from_secs(15)))
+        .with_sse_retry(Some(Duration::from_secs(3)))
+        .with_stateful_mode(true)
+        .with_allowed_hosts(["localhost", "127.0.0.1", "::1"]);
+    let server = mount.server;
+    let mcp_service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        config,
+    );
+
+    let path = format!("/mcp/{}", mount.project_id);
+    Router::new()
+        .nest_service(&path, mcp_service)
+        .layer(ValidateRequestHeaderLayer::custom(BearerValidator::new(
+            mount.token,
+        )))
 }

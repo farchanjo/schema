@@ -6,6 +6,7 @@
 //! `pub use` flattening (the `pub_use` lint blocks it project-wide).
 
 pub mod cleanup;
+pub mod daemon;
 pub mod delta_sync;
 pub mod project_instance;
 pub mod query;
