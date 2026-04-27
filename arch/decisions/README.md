@@ -47,4 +47,5 @@ pointing at the CI check that proves the decision is still in effect.
 | 0023 | [Config resolution: walk-up + ENV overlay](./0023-env-overlay-and-walk-up-config-resolution.md) | accepted | 2026-04-26 |
 | 0024 | [E2E test category in Python (pytest + httpx)](./0024-e2e-tests-python-pytest.md) | accepted | 2026-04-26 |
 | 0025 | [LLM `synthesize` tool + `LlmProvider` port (Anthropic / OpenAI)](./0025-llm-synthesize-tool-and-provider-port.md) | accepted | 2026-04-26 |
-| 0026 | [One shared daemon for all projects, with strict per-project isolation](./0026-shared-multi-project-daemon-with-strict-isolation.md) | accepted (amends 0019/0020/0021; implementation gated on fitness function) | 2026-04-26 |
+| 0026 | [One shared daemon for all projects, with strict per-project isolation](./0026-shared-multi-project-daemon-with-strict-isolation.md) | accepted (drivers preserved; routing/membership specifics partially superseded by 0027) | 2026-04-26 |
+| 0027 | [LLM-driven project discovery: directory-as-source-of-truth](./0027-llm-driven-project-discovery.md) | proposed (refactor PRs gated on operator confirmation + canary fitness) | 2026-04-26 |
