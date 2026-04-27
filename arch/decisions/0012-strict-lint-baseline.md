@@ -269,6 +269,17 @@ in repo settings.
   generates an inner method with the same name) and one for
   `clippy::unused_self` on the same fn (rmcp tool handlers
   must be methods on the server type)._
+- _2026-04-27 — operational playbook landed at
+  `arch/operations/rust-lint-playbook.md`. Mirrors the
+  `rust-strict-lint` Anthropic skill section 4 ("most-encountered
+  lints") with concrete remediation patterns, file/line
+  evidence from this repo, and a hooks-for-agents block
+  forbidding `Cargo.toml [lints.*]` / `clippy.toml` /
+  `rust-toolchain.toml` edits without an ADR amendment. CLAUDE.md
+  links it from the "Coding conventions" section so a fresh
+  contributor (human or agent) finds the cookbook before
+  reaching for `#[allow]`._
+
 - _2026-04-25 — **Layer C amendment: `unsafe_code` downgraded
   from `forbid` to `deny`** as the original ADR text already
   flagged would happen "if FASE 2 ever requires `unsafe`".

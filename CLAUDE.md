@@ -201,6 +201,28 @@ schema serve --config /path/to/project/schema.toml
 - Public API doc-comments use `///`; internal explanatory notes use `//`.
 - Tests near code: `#[cfg(test)] mod tests { ... }` or `tests/` for integration.
 
+### Lint gate (ADR-0012)
+
+The project runs Clippy with the **`rust-strict-lint` baseline** —
+Layer A `forbid`, Layer B `deny` (groups + 29 quality lints), Layer
+C `deny` (rustc anti-dead-code). Canonical gate:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test
+```
+
+Cookbook for fixing the lints you'll actually hit (`absolute_paths`,
+`too_many_lines`, `format_push_string`, `as_conversions`,
+`missing_errors_doc`, `doc_markdown`, …):
+**`arch/operations/rust-lint-playbook.md`**.
+
+**Never** edit `Cargo.toml [lints.*]`, `clippy.toml`, or
+`rust-toolchain.toml` to silence a lint. Fix the code. Re-opening
+a lint requires an ADR amending ADR-0012 (mirror of the global PMD
+rule).
+
 ## Commit conventions (Angular-flavored)
 
 ```
