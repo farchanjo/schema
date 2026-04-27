@@ -39,11 +39,89 @@ use tracing::info;
 
 use std::path::Path;
 
+use serde::de::Unexpected;
+use serde_json::Value;
+
 use crate::adapters::auth::BearerValidator;
 use crate::app::daemon::Daemon;
 use crate::app::project_instance::ProjectInstance;
 use crate::app::synthesize::{Citation, SynthesizeOutput};
 use crate::domain::ChunkRecord;
+
+/// Permissive deserializer for `Option<usize>` on tool-call parameters
+/// (ADR-0032 §"Decision" item 3).
+///
+/// MCP clients in the wild occasionally coerce numeric arguments to
+/// strings — observed on Claude Code's `query` tool dispatch on
+/// 2026-04-27, where `top_k: 3` arrived on the wire as
+/// `"top_k": "3"` and serde rejected it with `invalid type: string
+/// "3", expected usize`. This helper accepts integer or numeric
+/// string for every `Option<usize>` field on a `*Params` struct so
+/// the integer-override path stays unbroken regardless of which
+/// client is wiring us.
+///
+/// Applied to: `QueryParams.top_k`, `FindDecisionsParams.top_k`,
+/// `GlossaryLookupParams.top_k`, `SynthesizeParams.top_k`,
+/// `CrossReferenceParams.definition_limit`,
+/// `CrossReferenceParams.reference_limit`. Adding a new
+/// `Option<usize>` field on a `*Params` struct without this helper
+/// reopens the bug class — keep this list in sync.
+fn deserialize_optional_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => n
+            .as_u64()
+            .and_then(|v| usize::try_from(v).ok())
+            .map(Some)
+            .ok_or_else(|| {
+                Error::invalid_value(
+                    Unexpected::Other(&n.to_string()),
+                    &"a non-negative integer fitting in usize",
+                )
+            }),
+        Some(Value::String(s)) => s.parse::<usize>().map(Some).map_err(|err| {
+            Error::custom(format!(
+                "expected a usize-parseable string, got {s:?}: {err}"
+            ))
+        }),
+        Some(other) => Err(Error::invalid_type(
+            unexpected_for(&other),
+            &"integer or numeric string",
+        )),
+    }
+}
+
+fn unexpected_for(v: &Value) -> Unexpected<'_> {
+    match v {
+        Value::Null => Unexpected::Unit,
+        Value::Bool(b) => Unexpected::Bool(*b),
+        Value::Number(_) => Unexpected::Other("number"),
+        Value::String(s) => Unexpected::Str(s),
+        Value::Array(_) => Unexpected::Seq,
+        Value::Object(_) => Unexpected::Map,
+    }
+}
+
+/// One-shot WARN logged the first time the deprecated `query` alias is
+/// invoked in a process (ADR-0032 §"Decision" item 2). Mirrors the
+/// `Once::call_once` shape used for the env-source secret WARN
+/// (ADR-0031 §"Decision" item 6).
+fn warn_query_alias_once() {
+    use std::sync::Once;
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            "tools: deprecated MCP tool `query` invoked — rewire to `search` \
+             (ADR-0032). The `query` alias will be removed on 2026-05-27."
+        );
+    });
+}
 
 /// Empty parameter set — `ping` takes no arguments.
 ///
@@ -133,7 +211,7 @@ pub struct SynthesizeParams {
     /// focused questions to save tokens; higher (12-16) for
     /// exploratory questions where the answer needs wider context.
     /// Hard-clamped to 1..=16.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_usize")]
     pub top_k: Option<usize>,
 }
 
@@ -205,7 +283,7 @@ pub struct QueryParams {
     pub query: String,
 
     /// Override for K (default 8). Higher = more breadth, lower = more precision.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_usize")]
     pub top_k: Option<usize>,
 }
 
@@ -220,7 +298,7 @@ pub struct FindDecisionsParams {
     pub query: String,
 
     /// Override for K (default 8). Higher = more breadth, lower = more precision.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_usize")]
     pub top_k: Option<usize>,
 }
 
@@ -235,7 +313,7 @@ pub struct GlossaryLookupParams {
     pub term: String,
 
     /// Override for K (default 8). Higher = more breadth, lower = more precision.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_usize")]
     pub top_k: Option<usize>,
 }
 
@@ -266,11 +344,11 @@ pub struct CrossReferenceParams {
     pub artifact_id: String,
 
     /// Cap on defining chunks (default 16). Definitions are usually 1-3.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_usize")]
     pub definition_limit: Option<usize>,
 
     /// Cap on referencing chunks (default 32). Set higher for popular ADRs that are referenced widely.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_optional_usize")]
     pub reference_limit: Option<usize>,
 }
 
@@ -386,11 +464,27 @@ impl SchemaServer {
     }
 
     /// Generic semantic-search tool. Embeds the query string, returns top-K
-    /// closest chunks.
+    /// closest chunks. ADR-0032 canonical name.
     #[tool(
-        description = "Semantic search across the project corpus resolved from working_directory. Use for general questions when you don't know the kind, or when you want hits across ADRs, glossary, and prose at once. Example queries: 'how does session lifetime work', 'what is the chunking strategy for markdown'."
+        description = "Semantic search across the project corpus resolved from working_directory. Use for general questions when you don't know the kind, or when you want hits across ADRs, glossary, and prose at once. Example queries: 'how does session lifetime work', 'what is the chunking strategy for markdown'. Replaces the deprecated `query` tool — same shape, clearer name (ADR-0032)."
+    )]
+    async fn search(&self, Parameters(params): Parameters<QueryParams>) -> String {
+        self.run_search_inner(params).await
+    }
+
+    /// Deprecated alias — kept registered until the 2026-05-27 cutover so
+    /// consumer-side wiring that still names `query` keeps working.
+    /// Forwards to `search`. Emits a one-shot WARN per process on first
+    /// invocation (ADR-0032 §"Decision" item 2).
+    #[tool(
+        description = "**Deprecated**: use `search`. Retained until 2026-05-27 for wiring compatibility (ADR-0032). Same shape and semantics as `search`."
     )]
     async fn query(&self, Parameters(params): Parameters<QueryParams>) -> String {
+        warn_query_alias_once();
+        self.run_search_inner(params).await
+    }
+
+    async fn run_search_inner(&self, params: QueryParams) -> String {
         let project = match self.resolve(&params.working_directory).await {
             Ok(project) => project,
             Err(message) => return format_error(&message),
@@ -741,4 +835,76 @@ pub fn build_router(
             header::AUTHORIZATION,
         )))
         .layer(TraceLayer::new_for_http())
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test fixtures may panic if the env is broken"
+    )]
+
+    use super::*;
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct Envelope {
+        #[serde(default, deserialize_with = "deserialize_optional_usize")]
+        top_k: Option<usize>,
+    }
+
+    fn parse(raw: &str) -> Result<Envelope, serde_json::Error> {
+        serde_json::from_str(raw)
+    }
+
+    #[test]
+    fn deserialize_optional_usize_accepts_integer() {
+        assert_eq!(parse(r#"{"top_k":3}"#).unwrap().top_k, Some(3));
+    }
+
+    #[test]
+    fn deserialize_optional_usize_accepts_numeric_string() {
+        assert_eq!(parse(r#"{"top_k":"3"}"#).unwrap().top_k, Some(3));
+    }
+
+    #[test]
+    fn deserialize_optional_usize_accepts_null() {
+        assert_eq!(parse(r#"{"top_k":null}"#).unwrap().top_k, None);
+    }
+
+    #[test]
+    fn deserialize_optional_usize_accepts_absent() {
+        assert_eq!(parse("{}").unwrap().top_k, None);
+    }
+
+    #[test]
+    fn deserialize_optional_usize_rejects_non_numeric_string() {
+        assert!(parse(r#"{"top_k":"abc"}"#).is_err());
+    }
+
+    #[test]
+    fn deserialize_optional_usize_rejects_negative_numeric_string() {
+        assert!(parse(r#"{"top_k":"-1"}"#).is_err());
+    }
+
+    #[test]
+    fn deserialize_optional_usize_rejects_boolean() {
+        assert!(parse(r#"{"top_k":true}"#).is_err());
+    }
+
+    #[test]
+    fn deserialize_optional_usize_rejects_array() {
+        assert!(parse(r#"{"top_k":[3]}"#).is_err());
+    }
+
+    #[test]
+    fn deserialize_optional_usize_rejects_object() {
+        assert!(parse(r#"{"top_k":{"value":3}}"#).is_err());
+    }
+
+    #[test]
+    fn deserialize_optional_usize_rejects_negative_integer() {
+        // serde_json represents -1 as Number; as_u64 returns None.
+        assert!(parse(r#"{"top_k":-1}"#).is_err());
+    }
 }
