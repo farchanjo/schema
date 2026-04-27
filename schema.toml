@@ -1,0 +1,22 @@
+[project]
+name = "mcp-schema"
+version = "1"
+
+# Dogfood: this tool indexes its own architecture documentation so the
+# daemon can answer questions about the schema project itself when run
+# from this working directory (ADR-0027 lazy discovery).
+
+[[corpus]]
+path = "arch/decisions"
+kind = "adr-madr"
+
+[[corpus]]
+path = "arch/operations"
+kind = "markdown"
+
+[[corpus]]
+path = "CLAUDE.md"
+kind = "markdown"
+
+[embedding]
+nice = 5
