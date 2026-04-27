@@ -43,8 +43,9 @@ use schema::app::cleanup::Cleanup;
 use schema::app::daemon::Daemon;
 use schema::app::project_instance::{ProjectInstance, spawn_project_watcher};
 use schema::cli::install::{
-    InstallInputs, launchd_label, render_linux_unit, render_macos_plist,
-    render_mcp_config_fragment, systemd_unit_name,
+    DAEMON_LAUNCHD_LABEL, DAEMON_SYSTEMD_UNIT_NAME, DaemonInstallInputs, InstallInputs,
+    launchd_label, render_linux_daemon_unit, render_linux_unit, render_macos_daemon_plist,
+    render_macos_plist, render_mcp_config_fragment, systemd_unit_name,
 };
 use schema::ports::{Embedder, LlmProvider, MetadataStore, Persistence};
 
@@ -137,40 +138,87 @@ fn forget_subcommand(config_arg: Arg) -> Command {
         )
 }
 
-/// `schema install --service --config X [--binary-path Y]` (ADR-0020).
+/// `schema install --service --config X [--binary-path Y]` (ADR-0020) or
+/// `schema install --daemon [--binary-path Y] [--nice N]` (ADR-0027).
 fn install_subcommand(config_arg: Arg) -> Command {
     Command::new("install")
         .about(
-            "Render and install the per-project service unit (launchd plist on macOS; systemd user unit on Linux). Requires --service flag (ADR-0020).",
+            "Render and install a service unit. Two mutually exclusive shapes: \
+             --service installs the per-project unit (ADR-0020); --daemon installs \
+             the workstation-level shared daemon unit (ADR-0027).",
         )
         .arg(config_arg)
-        .arg(
-            Arg::new("service")
-                .long("service")
-                .action(clap::ArgAction::SetTrue)
-                .required(true)
-                .help("Confirm install of the OS service unit (no other install variant exists yet)."),
-        )
-        .arg(
-            Arg::new("binary-path")
-                .long("binary-path")
-                .value_name("PATH")
-                .value_parser(clap::value_parser!(PathBuf))
-                .help("Override the binary path written into the unit (default: /usr/local/bin/schema per ADR-0014)."),
+        .arg(install_service_flag())
+        .arg(install_daemon_flag())
+        .arg(install_nice_arg())
+        .arg(install_binary_path_arg())
+}
+
+fn install_service_flag() -> Arg {
+    Arg::new("service")
+        .long("service")
+        .action(clap::ArgAction::SetTrue)
+        .conflicts_with("daemon")
+        .help("Install the per-project unit (ADR-0020). Requires --config.")
+}
+
+fn install_daemon_flag() -> Arg {
+    Arg::new("daemon")
+        .long("daemon")
+        .action(clap::ArgAction::SetTrue)
+        .conflicts_with("service")
+        .help(
+            "Install the workstation-level shared daemon unit (ADR-0027). \
+             No --config flag — project membership is lazy via working_directory.",
         )
 }
 
-/// `schema uninstall --service --config X` (ADR-0020).
+fn install_nice_arg() -> Arg {
+    Arg::new("nice")
+        .long("nice")
+        .value_name("N")
+        .value_parser(clap::value_parser!(u8))
+        .default_value("5")
+        .help(
+            "ONNX-thread CPU politeness for the daemon unit (ADR-0018). \
+             Per-project --service mode reads `[embedding].nice` from schema.toml \
+             and ignores this flag.",
+        )
+}
+
+fn install_binary_path_arg() -> Arg {
+    Arg::new("binary-path")
+        .long("binary-path")
+        .value_name("PATH")
+        .value_parser(clap::value_parser!(PathBuf))
+        .help(
+            "Override the binary path written into the unit \
+             (default: /usr/local/bin/schema per ADR-0014).",
+        )
+}
+
+/// `schema uninstall --service --config X` (ADR-0020) or
+/// `schema uninstall --daemon` (ADR-0027).
 fn uninstall_subcommand(config_arg: Arg) -> Command {
     Command::new("uninstall")
-        .about("Remove the per-project service unit installed by `schema install --service` (ADR-0020).")
+        .about(
+            "Remove a service unit. --service removes a per-project unit (ADR-0020); \
+             --daemon removes the workstation-level shared daemon unit (ADR-0027).",
+        )
         .arg(config_arg)
         .arg(
             Arg::new("service")
                 .long("service")
                 .action(clap::ArgAction::SetTrue)
-                .required(true)
-                .help("Confirm uninstall of the OS service unit."),
+                .conflicts_with("daemon")
+                .help("Uninstall the per-project unit (ADR-0020). Requires --config."),
+        )
+        .arg(
+            Arg::new("daemon")
+                .long("daemon")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("service")
+                .help("Uninstall the workstation-level shared daemon unit (ADR-0027)."),
         )
 }
 
@@ -196,6 +244,42 @@ fn mcp_config_subcommand(config_arg: Arg) -> Command {
         .arg(config_arg)
 }
 
+async fn run_forget_dispatch(sub: &ArgMatches) -> Result<()> {
+    let path = sub
+        .get_one::<String>("path")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("--path is required for `schema forget`"))?;
+    run_forget(config_from(sub), path).await
+}
+
+fn run_install_dispatch(sub: &ArgMatches) -> Result<()> {
+    let binary_override = sub.get_one::<PathBuf>("binary-path").cloned();
+    if sub.get_flag("daemon") {
+        let nice = sub.get_one::<u8>("nice").copied().unwrap_or(5);
+        run_install_daemon(binary_override, nice)
+    } else if sub.get_flag("service") {
+        run_install_service(&config_from(sub), binary_override)
+    } else {
+        Err(anyhow::anyhow!(
+            "`schema install` requires either --service (per-project, ADR-0020) \
+             or --daemon (workstation-level, ADR-0027)"
+        ))
+    }
+}
+
+fn run_uninstall_dispatch(sub: &ArgMatches) -> Result<()> {
+    if sub.get_flag("daemon") {
+        run_uninstall_daemon()
+    } else if sub.get_flag("service") {
+        run_uninstall_service(&config_from(sub))
+    } else {
+        Err(anyhow::anyhow!(
+            "`schema uninstall` requires either --service (per-project, ADR-0020) \
+             or --daemon (workstation-level, ADR-0027)"
+        ))
+    }
+}
+
 fn config_from(matches: &ArgMatches) -> PathBuf {
     matches
         .get_one::<PathBuf>("config")
@@ -213,18 +297,9 @@ async fn main() -> Result<()> {
         Some(("serve", sub)) => run_serve(config_from(sub)).await,
         Some(("validate", sub)) => run_validate(&config_from(sub)),
         Some(("reset", sub)) => run_reset(config_from(sub), sub.get_flag("yes")).await,
-        Some(("forget", sub)) => {
-            let path = sub
-                .get_one::<String>("path")
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("--path is required for `schema forget`"))?;
-            run_forget(config_from(sub), path).await
-        }
-        Some(("install", sub)) => {
-            let binary_override = sub.get_one::<PathBuf>("binary-path").cloned();
-            run_install_service(&config_from(sub), binary_override)
-        }
-        Some(("uninstall", sub)) => run_uninstall_service(&config_from(sub)),
+        Some(("forget", sub)) => run_forget_dispatch(sub).await,
+        Some(("install", sub)) => run_install_dispatch(sub),
+        Some(("uninstall", sub)) => run_uninstall_dispatch(sub),
         Some(("service", sub)) => match sub.subcommand() {
             Some(("status", inner)) => run_service_status(&config_from(inner)),
             _ => Err(anyhow::anyhow!(
@@ -667,9 +742,88 @@ fn write_unit_file(unit_path: &Path, inputs: &InstallInputs) -> Result<()> {
 }
 
 fn print_install_hint(out: &mut impl Write, project_id: &str, unit_path: &Path) -> Result<()> {
+    let label = if cfg!(target_os = "macos") {
+        launchd_label(project_id)
+    } else {
+        systemd_unit_name(project_id)
+    };
+    print_load_hint(out, &label, unit_path)
+}
+
+/// `schema install --daemon` (ADR-0027). Render the workstation-level
+/// unit (no `--config` flag, no `{project_id}` slot, single label
+/// `com.farchanjo.schema.daemon`), write it to the per-OS
+/// `LaunchAgents` / systemd location, print the operator command to
+/// load it.
+fn run_install_daemon(binary_override: Option<PathBuf>, nice: u8) -> Result<()> {
+    let inputs = DaemonInstallInputs::resolve(binary_override, nice)?;
+    if let Some(parent) = inputs.stderr_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating daemon state dir {}", parent.display()))?;
+    }
+    let unit_path = daemon_unit_path()?;
+    write_daemon_unit_file(&unit_path, &inputs)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "wrote daemon unit: {}", unit_path.display())?;
+    print_load_hint(&mut out, daemon_unit_label(), &unit_path)
+}
+
+/// Mirror of [`run_uninstall_service`] for the workstation-level
+/// daemon unit (ADR-0027). Removes the unit file from disk and prints
+/// the operator command to unload it.
+fn run_uninstall_daemon() -> Result<()> {
+    let unit_path = daemon_unit_path()?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    print_unload_hint(&mut out, daemon_unit_label())?;
+    if unit_path.exists() {
+        fs::remove_file(&unit_path).with_context(|| format!("removing {}", unit_path.display()))?;
+        writeln!(out, "removed daemon unit: {}", unit_path.display())?;
+    } else {
+        writeln!(out, "daemon unit absent: {}", unit_path.display())?;
+    }
+    Ok(())
+}
+
+const fn daemon_unit_label() -> &'static str {
     if cfg!(target_os = "macos") {
-        let label = launchd_label(project_id);
-        writeln!(out)?;
+        DAEMON_LAUNCHD_LABEL
+    } else {
+        DAEMON_SYSTEMD_UNIT_NAME
+    }
+}
+
+fn daemon_unit_path() -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home dir not resolvable"))?;
+    if cfg!(target_os = "macos") {
+        Ok(home
+            .join("Library/LaunchAgents")
+            .join(format!("{DAEMON_LAUNCHD_LABEL}.plist")))
+    } else {
+        Ok(home
+            .join(".config/systemd/user")
+            .join(DAEMON_SYSTEMD_UNIT_NAME))
+    }
+}
+
+fn write_daemon_unit_file(unit_path: &Path, inputs: &DaemonInstallInputs) -> Result<()> {
+    if let Some(parent) = unit_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating daemon unit directory {}", parent.display()))?;
+    }
+    let rendered = if cfg!(target_os = "macos") {
+        render_macos_daemon_plist(inputs)
+    } else {
+        render_linux_daemon_unit(inputs)
+    };
+    fs::write(unit_path, rendered).with_context(|| format!("writing {}", unit_path.display()))?;
+    Ok(())
+}
+
+fn print_load_hint(out: &mut impl Write, label: &str, unit_path: &Path) -> Result<()> {
+    writeln!(out)?;
+    if cfg!(target_os = "macos") {
         writeln!(
             out,
             "to load (idempotent — bootout first if already loaded):"
@@ -684,13 +838,22 @@ fn print_install_hint(out: &mut impl Write, project_id: &str, unit_path: &Path) 
             unit_path.display()
         )?;
     } else {
-        writeln!(out)?;
         writeln!(out, "to load:")?;
         writeln!(
             out,
-            "  systemctl --user daemon-reload && systemctl --user enable --now {}",
-            systemd_unit_name(project_id)
+            "  systemctl --user daemon-reload && systemctl --user enable --now {label}"
         )?;
+    }
+    Ok(())
+}
+
+fn print_unload_hint(out: &mut impl Write, label: &str) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        writeln!(out, "to unload first (idempotent):")?;
+        writeln!(out, "  launchctl bootout gui/$(id -u)/{label} 2>/dev/null")?;
+    } else {
+        writeln!(out, "to disable + stop first:")?;
+        writeln!(out, "  systemctl --user disable --now {label}")?;
     }
     Ok(())
 }
