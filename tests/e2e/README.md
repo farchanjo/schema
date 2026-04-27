@@ -54,6 +54,7 @@ fallback. Override with `SCHEMA_E2E_BINARY=/path/to/schema`.
 | `test_endpoint_toml.py`           | mode 0600 / version=1 / RFC3339 / PID                   | ADR-0021 |
 | `test_error_handling.py`          | invalid tool name / malformed JSON-RPC / no token leaks | ADR-0019, ADR-0021 |
 | `test_workspace_context.py`       | tool returns project + corpus + embedding from config   | ADR-0009 amendment |
+| `test_adr0027_isolation.py`       | canary fitness function — single endpoint, two `working_directory` parameters, ALPHA-CANARY / BETA-CANARY isolation across `query` / `find_decisions` / `workspace_context` / `reset_index`; walk-up + no-`schema.toml` error envelope. Spawns `schema daemon`, marked `slow`. | ADR-0027 |
 
 ## Tested on
 

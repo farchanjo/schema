@@ -539,7 +539,40 @@ answer to the same question.
     `cli/project.rs` tests). 5 integration. Strict-lint
     gate green; `cargo fmt --all -- --check` clean.
 
-- **2026-04-27 — refactor PR #2 of 4 landed (this commit).**
+- **2026-04-27 — refactor PR #3 of 4 landed (this commit).**
+  Canary fitness function E2E. `tests/e2e/test_adr0027_isolation.py`
+  exercises the cutover gate from §"Fitness function".
+  - `_spawn_daemon` spawns `schema daemon` with `HOME=<tmp>` so the
+    global `endpoint.toml` lands at
+    `<tmp>/Library/Application Support/schema/endpoint.toml` (macOS)
+    / `<tmp>/.local/state/schema/endpoint.toml` (Linux), polls until
+    PID matches, returns the URL + bearer.
+  - Two synthetic projects under `tmp_path/fixtures/{alpha,beta}/`,
+    each with `schema.toml` + one ADR carrying a distinguishable
+    canary token (`ALPHA-CANARY-7f3` / `BETA-CANARY-9b2`).
+  - Six tests cover: query isolation, find_decisions isolation,
+    workspace_context resolves per-directory + distinct
+    `project.id`, walk-up from a subdirectory, no-`schema.toml`
+    error envelope (not 5xx, not silent empty), reset_index scopes
+    strictly to the resolved project.
+  - All marked `pytest.mark.slow`. `pytest.ini` registers the marker.
+    README index entry added pointing at ADR-0027.
+  - **Not run in CI today** — `.github/workflows/lint.yml` runs
+    `cargo` only; the E2E suite is operator-manual per ADR-0024 §"CI".
+    Wiring nightly/release-tag GHA workflow is a FASE 1.1 follow-up
+    tracked there.
+  - Manual run command on the operator's box (cold model cache —
+    expect 5-15 min):
+    ```
+    cd tests/e2e
+    pytest -v -m slow test_adr0027_isolation.py
+    ```
+  - Refactor PR #4 (next) wires the daemon-mode watcher recovery,
+    appends Evidence entries to ADR-0019 / ADR-0020 / ADR-0021
+    forward-pointing here, and amends `arch/operations/runbook.md`
+    "Migration to ADR-0026" with the ADR-0027 cutover sequence.
+
+- **2026-04-27 — refactor PR #2 of 4 landed.**
   Single-endpoint daemon + lazy resolve. ADR-0026 slices
   1, 2a, and 4 reverted; slice 4b's `schema daemon` runtime
   rewritten around the new shape; ADR-0019 single-project
