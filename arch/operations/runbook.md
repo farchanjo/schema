@@ -118,21 +118,54 @@ In the project repo (e.g. `~/dev/lowcow-platform`):
    service. Idempotent — re-running re-renders the unit file.
 
 4. **Generate the consumer-side `mcp-config` snippet** for Claude
-   Code's `.mcp.json`:
+   Code's `.mcp.json`. Two shapes are supported:
+
+   ### Shape B (canonical, ADR-0030) — `schema mcp-shim`
+
+   The default-recommended shape. Wires Claude Code at a stdio
+   `schema mcp-shim` binary that reads the global `endpoint.toml`
+   on every connect and on `401` / `ECONNREFUSED`. The bearer never
+   appears in `.mcp.json` and the wiring survives daemon restarts.
 
    ```bash
-   schema mcp-config --config schema.toml > /tmp/mcp-fragment.json
+   schema mcp-config --shim > /tmp/mcp-fragment.json
    ```
 
-   Output is the `mcpServers.schema` block carrying the URL +
-   bearer token from `endpoint.toml`. Paste into the consumer's
-   `.mcp.json`:
+   Output:
 
    ```json
    {
      "mcpServers": {
        "schema": {
-         "url": "http://127.0.0.1:48291",
+         "type": "stdio",
+         "command": "/usr/local/bin/schema",
+         "args": ["mcp-shim"]
+       }
+     }
+   }
+   ```
+
+   Paste once into the consumer's `.mcp.json`. **No regeneration
+   on restart** — the shim absorbs the URL+token rotation.
+
+   ### Shape A (legacy, ADR-0019/ADR-0021) — direct HTTP
+
+   Skips the shim and points Claude Code straight at the daemon's
+   HTTP `/mcp` mount with the live bearer inlined. Required only
+   for clients that do not support stdio MCP servers.
+
+   ```bash
+   schema mcp-config > /tmp/mcp-fragment.json
+   ```
+
+   Output:
+
+   ```json
+   {
+     "mcpServers": {
+       "schema": {
+         "type": "http",
+         "url": "http://127.0.0.1:48291/mcp",
          "headers": {
            "Authorization": "Bearer f47ac10b-58cc-..."
          }
@@ -141,11 +174,10 @@ In the project repo (e.g. `~/dev/lowcow-platform`):
    }
    ```
 
-   **Token rotates on every server restart.** After
-   `schema service status` shows a new `started_at` timestamp,
-   re-run `schema mcp-config` and re-paste. A `schema mcp-shim`
-   long-running proxy that re-reads `endpoint.toml` on `401` is
-   the planned follow-up (ADR-0021 §"Shape B").
+   **Token + port rotate on every daemon restart under Shape A.**
+   After `schema service status` shows a new `started_at`
+   timestamp, re-run `schema mcp-config` and re-paste. The whole
+   point of Shape B is to remove this toll.
 
 5. **Open Claude Code** in the project directory. It connects to
    the running HTTP MCP server via the `.mcp.json` fragment.
@@ -158,7 +190,9 @@ In the project repo (e.g. `~/dev/lowcow-platform`):
 schema install --service --config <path>     # render + write plist/unit
 schema uninstall --service --config <path>   # remove plist/unit
 schema service status --config <path>        # endpoint.toml + lifecycle hints
-schema mcp-config --config <path>            # ready-to-paste .mcp.json fragment
+schema mcp-config --shim                     # canonical .mcp.json (ADR-0030)
+schema mcp-config                            # legacy direct-HTTP shape (ADR-0019)
+schema mcp-shim                              # stdio↔HTTP bridge spawned by client
 ```
 
 Service identifiers per platform:

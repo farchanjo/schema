@@ -312,4 +312,21 @@ We adopt **option (d)**.
 
 ## Evidence and amendments
 
-(none yet — this ADR is `proposed`)
+- **2026-04-27 — implemented.** `src/cli/mcp_shim.rs` exposes the
+  stdio↔HTTP bridge module; `main.rs` wires the
+  `schema mcp-shim` subcommand and the `--shim` flag on
+  `schema mcp-config`. `src/cli/install.rs` adds
+  `render_mcp_config_shim_fragment` (stdio shape, no bearer in
+  the fragment). Six unit tests cover the SSE-keepalive skip,
+  the no-space `data:` form, no-data fallback, the
+  `forward_with_retry` path on 401 (re-reads `endpoint.toml`,
+  picks up the rotated token, retries successfully), and the
+  same path on `ECONNREFUSED` (re-reads `endpoint.toml`, picks
+  up the rotated URL, retries successfully) using
+  `axum`-served mock routers on `127.0.0.1:0`. End-to-end
+  smoke against the live daemon
+  (`echo '{"jsonrpc":"2.0","id":1,"method":"initialize",…}' |
+  schema mcp-shim`) returns the expected `initialize` result.
+  Validation gate green: 114 tests, fmt, clippy `-D warnings`.
+  Runbook §4 promoted Shape B (`--shim`) to canonical and
+  marked Shape A `legacy / per-restart`.
