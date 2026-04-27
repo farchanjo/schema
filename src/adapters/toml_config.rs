@@ -80,6 +80,17 @@ pub struct EmbeddingConfig {
     /// foreground processes.
     #[serde(default = "default_embedding_nice")]
     pub nice: u8,
+
+    /// Adopt the BAAI bge-m3 dense-retrieval recipe (ADR-0029): queries
+    /// are prefixed with `Represent this sentence for searching relevant
+    /// passages: ` and passages with `Represent this passage: `. Default
+    /// `false` (status quo: raw symmetric encoding). Flipping to `true`
+    /// triggers a one-time full re-embed of this project's corpus on the
+    /// next `schema run`; flipping back to `false` rebuilds with raw
+    /// embeddings. Mixing prefixed and raw embeddings degrades recall,
+    /// so the migration is all-or-nothing per project.
+    #[serde(default)]
+    pub query_passage_prefix: bool,
 }
 
 fn default_embedding_model() -> String {
@@ -95,6 +106,7 @@ impl Default for EmbeddingConfig {
         Self {
             model: default_embedding_model(),
             nice: default_embedding_nice(),
+            query_passage_prefix: false,
         }
     }
 }
@@ -112,6 +124,16 @@ pub struct RetrievalConfig {
     /// Maximum file size in bytes. Files above this are skipped with a warning.
     #[serde(default = "default_file_size_max")]
     pub file_size_max: u64,
+
+    /// Optional cosine-similarity floor applied to nearest-neighbour queries
+    /// (ADR-0028). When set, rows whose distance exceeds `1.0 - min_score`
+    /// are filtered out **inside** the SQL MATCH so the engine still
+    /// returns the full top-K of rows that pass the floor. No default —
+    /// absent setting means raw top-K, no floor. Recommended starting
+    /// point: `0.30` (cosine similarity); tighten per project after
+    /// observing noise hits.
+    #[serde(default)]
+    pub min_score: Option<f32>,
 }
 
 const fn default_top_k() -> usize {
@@ -130,6 +152,7 @@ impl Default for RetrievalConfig {
             top_k_default: default_top_k(),
             chunk_size_max: default_chunk_size_max(),
             file_size_max: default_file_size_max(),
+            min_score: None,
         }
     }
 }
@@ -285,6 +308,10 @@ impl SchemaConfig {
         if let Some(value) = parse_lookup::<u8>(lookup, "SCHEMA_EMBEDDING_NICE")? {
             self.embedding.nice = value;
         }
+        if let Some(value) = parse_lookup::<bool>(lookup, "SCHEMA_EMBEDDING_QUERY_PASSAGE_PREFIX")?
+        {
+            self.embedding.query_passage_prefix = value;
+        }
         Ok(())
     }
 
@@ -297,6 +324,9 @@ impl SchemaConfig {
         }
         if let Some(value) = parse_lookup::<u64>(lookup, "SCHEMA_RETRIEVAL_FILE_SIZE_MAX")? {
             self.retrieval.file_size_max = value;
+        }
+        if let Some(value) = parse_lookup::<f32>(lookup, "SCHEMA_RETRIEVAL_MIN_SCORE")? {
+            self.retrieval.min_score = Some(value);
         }
         Ok(())
     }
@@ -344,6 +374,11 @@ impl SchemaConfig {
             "SCHEMA_EMBEDDING_NICE",
         );
         log_knob(
+            "[embedding].query_passage_prefix",
+            &self.embedding.query_passage_prefix,
+            "SCHEMA_EMBEDDING_QUERY_PASSAGE_PREFIX",
+        );
+        log_knob(
             "[retrieval].top_k_default",
             &self.retrieval.top_k_default,
             "SCHEMA_RETRIEVAL_TOP_K_DEFAULT",
@@ -357,6 +392,14 @@ impl SchemaConfig {
             "[retrieval].file_size_max",
             &self.retrieval.file_size_max,
             "SCHEMA_RETRIEVAL_FILE_SIZE_MAX",
+        );
+        log_knob(
+            "[retrieval].min_score",
+            &self
+                .retrieval
+                .min_score
+                .map_or_else(|| "none".to_string(), |v| v.to_string()),
+            "SCHEMA_RETRIEVAL_MIN_SCORE",
         );
         log_knob(
             "[security].follow_symlinks",
