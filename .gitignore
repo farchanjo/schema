@@ -33,3 +33,9 @@ tests/e2e/.venv/
 
 # Claude Code project metadata (machine-local)
 .claude/
+
+# Consumer-side MCP wiring (ADR-0030). `.mcp.json` is regenerated
+# locally by `schema mcp-config --shim` (or legacy `schema mcp-config`
+# for Shape A). Carries a bearer token under Shape A; under Shape B
+# it is per-machine and rotates with the daemon.
+.mcp.json
