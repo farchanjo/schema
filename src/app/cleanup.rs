@@ -139,6 +139,7 @@ mod tests {
             _vector: &[f32],
             _k: usize,
             _kind_filter: Option<&str>,
+            _min_score: Option<f32>,
         ) -> Result<Vec<ChunkRecord>, PersistenceError> {
             Ok(Vec::new())
         }
@@ -172,6 +173,14 @@ mod tests {
             let mut rows = self.rows.lock().unwrap();
             rows.clear();
             drop(rows);
+            Ok(())
+        }
+
+        async fn read_embedding_recipe(&self) -> Result<Option<String>, PersistenceError> {
+            Ok(None)
+        }
+
+        async fn write_embedding_recipe(&self, _recipe: &str) -> Result<(), PersistenceError> {
             Ok(())
         }
     }

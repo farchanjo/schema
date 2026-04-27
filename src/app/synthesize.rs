@@ -67,6 +67,10 @@ pub struct Synthesize {
     llm: Arc<dyn LlmProvider>,
     max_tokens: Option<u32>,
     temperature: Option<f32>,
+    /// Per-project ADR-0029 flag — same semantics as in [`crate::app::query::Query`].
+    query_passage_prefix: bool,
+    /// Per-project ADR-0028 score floor (cosine similarity); `None` ⇒ raw top-K.
+    min_score: Option<f32>,
 }
 
 impl fmt::Debug for Synthesize {
@@ -77,6 +81,8 @@ impl fmt::Debug for Synthesize {
             .field("llm", &self.llm.name())
             .field("max_tokens", &self.max_tokens)
             .field("temperature", &self.temperature)
+            .field("query_passage_prefix", &self.query_passage_prefix)
+            .field("min_score", &self.min_score)
             .finish()
     }
 }
@@ -110,6 +116,8 @@ impl Synthesize {
         llm: Arc<dyn LlmProvider>,
         max_tokens: Option<u32>,
         temperature: Option<f32>,
+        query_passage_prefix: bool,
+        min_score: Option<f32>,
     ) -> Self {
         Self {
             persistence,
@@ -117,6 +125,8 @@ impl Synthesize {
             llm,
             max_tokens,
             temperature,
+            query_passage_prefix,
+            min_score,
         }
     }
 
@@ -157,13 +167,16 @@ impl Synthesize {
     async fn retrieve(&self, query_text: &str, top_k: usize) -> Result<Vec<ChunkRecord>> {
         let vector = {
             let mut emb = self.embedder.lock().await;
-            let mut vectors = emb.embed(vec![query_text.to_string()]).await?;
+            let v = emb
+                .embed_query(query_text.to_string(), self.query_passage_prefix)
+                .await?;
             drop(emb);
-            vectors
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("embedder returned no vectors"))?
+            v
         };
-        let hits: Vec<ChunkRecord> = self.persistence.query_nearest(&vector, top_k, None).await?;
+        let hits: Vec<ChunkRecord> = self
+            .persistence
+            .query_nearest(&vector, top_k, None, self.min_score)
+            .await?;
         Ok(truncate_to_budget(hits, PROMPT_CONTEXT_BUDGET_BYTES))
     }
 

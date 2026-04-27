@@ -43,7 +43,9 @@ use crate::adapters::filesystem::{NotifyWatcher, WalkdirWalker};
 use crate::adapters::markdown_chunker::MarkdownChunker;
 use crate::adapters::metadata_store::TomlMetadataStore;
 use crate::adapters::project_identity::ProjectIdentity;
-use crate::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_dir};
+use crate::adapters::sqlite_vec_store::{
+    RECIPE_BGE_M3_QUERY_PASSAGE, RECIPE_RAW, SqliteVecStore, migrate_legacy_lance_dir,
+};
 use crate::adapters::toml_config::SchemaConfig;
 use crate::app::cleanup::Cleanup;
 use crate::app::delta_sync::{DeltaSync, corpus_paths_from_config};
@@ -102,6 +104,12 @@ impl ProjectInstance {
         llm_provider: Option<Arc<dyn LlmProvider>>,
     ) -> Result<Self> {
         let ports = WiredPorts::open(&config, &identity).await?;
+        align_embedding_recipe(
+            &*ports.persistence,
+            &identity,
+            config.embedding.query_passage_prefix,
+        )
+        .await?;
         let use_cases = WiredUseCases::build(&config, &ports, embedder, llm_provider);
         Ok(Self::assemble(config, identity, ports, use_cases))
     }
@@ -176,6 +184,41 @@ impl fmt::Debug for ProjectInstance {
     }
 }
 
+/// Reconcile the project's persisted embedding recipe (ADR-0029)
+/// against the desired recipe derived from the `[embedding]
+/// query_passage_prefix` flag. Mismatch triggers a `reset_all` so the
+/// next delta-sync rebuilds the corpus from disk under the desired
+/// recipe — simpler than the in-place re-embed sketched in ADR-0029
+/// and equivalent in outcome (the scalar `chunks` table is fully
+/// derivable from disk; the daemon walks the corpus on startup
+/// regardless). The recipe row is stamped before delta-sync runs so
+/// a crash mid-rebuild leaves the next start in a defined state
+/// (recipe matches; `chunks_vec` empty; delta-sync re-fills it).
+async fn align_embedding_recipe(
+    persistence: &dyn Persistence,
+    identity: &ProjectIdentity,
+    query_passage_prefix: bool,
+) -> Result<()> {
+    let desired = if query_passage_prefix {
+        RECIPE_BGE_M3_QUERY_PASSAGE
+    } else {
+        RECIPE_RAW
+    };
+    let stored = persistence.read_embedding_recipe().await?;
+    if stored.as_deref() == Some(desired) {
+        return Ok(());
+    }
+    tracing::warn!(
+        project = %identity.id,
+        from = %stored.as_deref().unwrap_or("<absent>"),
+        to = %desired,
+        "embedding recipe mismatch (ADR-0029); resetting store, delta-sync will rebuild",
+    );
+    persistence.reset_all().await?;
+    persistence.write_embedding_recipe(desired).await?;
+    Ok(())
+}
+
 /// Per-project ports (the "outbound" half of hexagonal). Built once
 /// in [`WiredPorts::open`] and consumed by [`WiredUseCases::build`].
 struct WiredPorts {
@@ -226,22 +269,24 @@ impl WiredUseCases {
         embedder: &Arc<Mutex<dyn Embedder>>,
         llm_provider: Option<Arc<dyn LlmProvider>>,
     ) -> Self {
-        let sync = DeltaSync::new(
+        let query_passage_prefix = config.embedding.query_passage_prefix;
+        let min_score = config.retrieval.min_score;
+        let sync = build_sync(ports, embedder, query_passage_prefix);
+        let query = Query::new(
             Arc::clone(&ports.persistence),
             Arc::clone(embedder),
-            Arc::clone(&ports.walker),
-            Arc::clone(&ports.chunker),
-            Arc::clone(&ports.metadata),
+            query_passage_prefix,
+            min_score,
         );
-        let query = Query::new(Arc::clone(&ports.persistence), Arc::clone(embedder));
         let cleanup = Cleanup::new(Arc::clone(&ports.persistence), Arc::clone(&ports.metadata));
         let synthesize = llm_provider.map(|provider| {
-            Synthesize::new(
-                Arc::clone(&ports.persistence),
-                Arc::clone(embedder),
+            build_synthesize(
+                config,
+                ports,
+                embedder,
                 provider,
-                config.llm.max_tokens,
-                config.llm.temperature,
+                query_passage_prefix,
+                min_score,
             )
         });
         Self {
@@ -251,4 +296,38 @@ impl WiredUseCases {
             synthesize,
         }
     }
+}
+
+fn build_sync(
+    ports: &WiredPorts,
+    embedder: &Arc<Mutex<dyn Embedder>>,
+    query_passage_prefix: bool,
+) -> DeltaSync {
+    DeltaSync::new(
+        Arc::clone(&ports.persistence),
+        Arc::clone(embedder),
+        Arc::clone(&ports.walker),
+        Arc::clone(&ports.chunker),
+        Arc::clone(&ports.metadata),
+        query_passage_prefix,
+    )
+}
+
+fn build_synthesize(
+    config: &SchemaConfig,
+    ports: &WiredPorts,
+    embedder: &Arc<Mutex<dyn Embedder>>,
+    provider: Arc<dyn LlmProvider>,
+    query_passage_prefix: bool,
+    min_score: Option<f32>,
+) -> Synthesize {
+    Synthesize::new(
+        Arc::clone(&ports.persistence),
+        Arc::clone(embedder),
+        provider,
+        config.llm.max_tokens,
+        config.llm.temperature,
+        query_passage_prefix,
+        min_score,
+    )
 }

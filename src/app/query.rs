@@ -16,10 +16,25 @@ use crate::domain::ChunkRecord;
 use crate::ports::{Embedder, Persistence};
 
 /// Read-side service. Cheap to clone; holds `Arc`s.
+///
+/// `query_passage_prefix` (ADR-0029) and `min_score` (ADR-0028) are
+/// captured at wire time from the project's `schema.toml` and threaded
+/// into every `embed_query` / `query_nearest` call so the daemon's
+/// shared embedder + per-project store honour the project's recipe.
 #[derive(Clone)]
+#[expect(
+    clippy::struct_field_names,
+    reason = "field name `query_passage_prefix` mirrors the public \
+              schema.toml `[embedding] query_passage_prefix` knob; \
+              renaming would diverge from the user-facing config key \
+              for no semantic gain — the prefix collision with the \
+              struct name is incidental"
+)]
 pub struct Query {
     persistence: Arc<dyn Persistence>,
     embedder: Arc<Mutex<dyn Embedder>>,
+    query_passage_prefix: bool,
+    min_score: Option<f32>,
 }
 
 impl fmt::Debug for Query {
@@ -27,6 +42,8 @@ impl fmt::Debug for Query {
         f.debug_struct("Query")
             .field("persistence", &"<dyn Persistence>")
             .field("embedder", &"<Mutex<dyn Embedder>>")
+            .field("query_passage_prefix", &self.query_passage_prefix)
+            .field("min_score", &self.min_score)
             .finish()
     }
 }
@@ -40,10 +57,17 @@ pub struct CrossReference {
 
 impl Query {
     #[must_use]
-    pub fn new(persistence: Arc<dyn Persistence>, embedder: Arc<Mutex<dyn Embedder>>) -> Self {
+    pub fn new(
+        persistence: Arc<dyn Persistence>,
+        embedder: Arc<Mutex<dyn Embedder>>,
+        query_passage_prefix: bool,
+        min_score: Option<f32>,
+    ) -> Self {
         Self {
             persistence,
             embedder,
+            query_passage_prefix,
+            min_score,
         }
     }
 
@@ -59,15 +83,15 @@ impl Query {
     ) -> Result<Vec<ChunkRecord>> {
         let vector = {
             let mut emb = self.embedder.lock().await;
-            let mut vectors = emb.embed(vec![query_text.to_string()]).await?;
+            let v = emb
+                .embed_query(query_text.to_string(), self.query_passage_prefix)
+                .await?;
             drop(emb);
-            vectors
-                .pop()
-                .ok_or_else(|| anyhow::anyhow!("embedder returned no vectors"))?
+            v
         };
         let records = self
             .persistence
-            .query_nearest(&vector, top_k, kind_filter)
+            .query_nearest(&vector, top_k, kind_filter, self.min_score)
             .await?;
         Ok(records)
     }

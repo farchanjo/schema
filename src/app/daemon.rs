@@ -257,7 +257,19 @@ mod tests {
 
     #[async_trait]
     impl Embedder for MuteEmbedder {
-        async fn embed(&mut self, _texts: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
+        async fn embed_query(
+            &mut self,
+            _text: String,
+            _with_prefix: bool,
+        ) -> Result<Vec<f32>, EmbedError> {
+            Ok(Vec::new())
+        }
+
+        async fn embed_passages(
+            &mut self,
+            _texts: Vec<String>,
+            _with_prefix: bool,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
             Ok(Vec::new())
         }
     }

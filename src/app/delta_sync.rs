@@ -49,6 +49,12 @@ pub struct DeltaSync {
     walker: Arc<dyn Walker>,
     chunker: Arc<dyn Chunker>,
     metadata: Arc<dyn MetadataStore>,
+    /// Per-project ADR-0029 flag: whether `embed_passages` should
+    /// prepend the BAAI bge-m3 passage prefix. Captured at wire time
+    /// from `[embedding] query_passage_prefix`. Threaded into every
+    /// embed call so the daemon's shared embedder honours the
+    /// project's recipe.
+    query_passage_prefix: bool,
 }
 
 impl fmt::Debug for DeltaSync {
@@ -59,6 +65,7 @@ impl fmt::Debug for DeltaSync {
             .field("walker", &"<dyn Walker>")
             .field("chunker", &"<dyn Chunker>")
             .field("metadata", &"<dyn MetadataStore>")
+            .field("query_passage_prefix", &self.query_passage_prefix)
             .finish()
     }
 }
@@ -85,6 +92,7 @@ impl DeltaSync {
         walker: Arc<dyn Walker>,
         chunker: Arc<dyn Chunker>,
         metadata: Arc<dyn MetadataStore>,
+        query_passage_prefix: bool,
     ) -> Self {
         Self {
             persistence,
@@ -92,6 +100,7 @@ impl DeltaSync {
             walker,
             chunker,
             metadata,
+            query_passage_prefix,
         }
     }
 
@@ -189,7 +198,7 @@ impl DeltaSync {
             let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
             let vectors = {
                 let mut emb = self.embedder.lock().await;
-                emb.embed(texts).await?
+                emb.embed_passages(texts, self.query_passage_prefix).await?
             };
             self.persistence.append_chunks(&chunks, &vectors).await?;
             meta.chunk_count = chunks.len();
@@ -407,6 +416,7 @@ mod tests {
             _vector: &[f32],
             k: usize,
             _kind_filter: Option<&str>,
+            _min_score: Option<f32>,
         ) -> Result<Vec<ChunkRecord>, PersistenceError> {
             let rows = self.rows.lock().unwrap();
             let out: Vec<ChunkRecord> = rows
@@ -476,6 +486,14 @@ mod tests {
             drop(rows);
             Ok(())
         }
+
+        async fn read_embedding_recipe(&self) -> Result<Option<String>, PersistenceError> {
+            Ok(None)
+        }
+
+        async fn write_embedding_recipe(&self, _recipe: &str) -> Result<(), PersistenceError> {
+            Ok(())
+        }
     }
 
     /// Deterministic `Embedder` fake — produces a unit vector per input
@@ -485,7 +503,19 @@ mod tests {
 
     #[async_trait]
     impl Embedder for FakeEmbedder {
-        async fn embed(&mut self, texts: Vec<String>) -> Result<Vec<Vec<f32>>, EmbedError> {
+        async fn embed_query(
+            &mut self,
+            _text: String,
+            _with_prefix: bool,
+        ) -> Result<Vec<f32>, EmbedError> {
+            Ok(vec![1.0_f32, 0.0, 0.0])
+        }
+
+        async fn embed_passages(
+            &mut self,
+            texts: Vec<String>,
+            _with_prefix: bool,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
             Ok(texts.iter().map(|_| vec![1.0_f32, 0.0, 0.0]).collect())
         }
     }
@@ -604,6 +634,7 @@ mod tests {
             walker,
             chunker,
             Arc::<FakeMetadataStore>::clone(&metadata),
+            false,
         );
         (sync, persistence, metadata)
     }
