@@ -37,6 +37,7 @@ use schema::adapters::mcp_server::{SchemaServer, build_router};
 use schema::adapters::metadata_store::TomlMetadataStore;
 use schema::adapters::openai_provider::OpenAiProvider;
 use schema::adapters::project_identity::ProjectIdentity;
+use schema::adapters::secrets_toml::FileSecretStore;
 use schema::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_dir};
 use schema::adapters::toml_config::SchemaConfig;
 use schema::app::cleanup::Cleanup;
@@ -49,7 +50,8 @@ use schema::cli::install::{
     systemd_unit_name,
 };
 use schema::cli::mcp_shim;
-use schema::ports::{Embedder, LlmProvider, MetadataStore, Persistence};
+use schema::cli::secrets as secrets_cli;
+use schema::ports::{Embedder, LlmProvider, MetadataStore, Persistence, ProviderId, SecretStore};
 
 /// Build the top-level CLI definition using the clap builder API.
 ///
@@ -81,7 +83,46 @@ fn cli() -> Command {
         .subcommand(service_subcommand(config_arg.clone()))
         .subcommand(mcp_config_subcommand(config_arg))
         .subcommand(mcp_shim_subcommand())
+        .subcommand(secrets_subcommand())
         .subcommand(daemon_subcommand())
+}
+
+/// `schema secrets` (ADR-0031).
+fn secrets_subcommand() -> Command {
+    Command::new("secrets")
+        .about(
+            "Manage daemon LLM provider keys via mode-0600 secrets.toml \
+             (ADR-0031). Subcommand `migrate` reads ANTHROPIC_API_KEY / \
+             OPENAI_API_KEY from the current process environment and \
+             writes them into the canonical secrets.toml.",
+        )
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(secrets_migrate_subcommand())
+}
+
+fn secrets_migrate_subcommand() -> Command {
+    Command::new("migrate")
+        .about(
+            "Migrate provider keys from environment variables into the canonical secrets.toml (ADR-0031).",
+        )
+        .arg(
+            Arg::new("force")
+                .long("force")
+                .action(clap::ArgAction::SetTrue)
+                .help("Overwrite an existing secrets.toml. Mode 0600 is re-applied."),
+        )
+        .arg(
+            Arg::new("destination")
+                .long("destination")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help(
+                    "Override the destination path. Defaults to \
+                     ~/Library/Application Support/schema/secrets.toml on macOS or \
+                     ~/.local/state/schema/secrets.toml on Linux.",
+                ),
+        )
 }
 
 /// `schema mcp-shim` (ADR-0030).
@@ -352,6 +393,12 @@ async fn main() -> Result<()> {
         },
         Some(("mcp-config", sub)) => run_mcp_config_dispatch(sub),
         Some(("mcp-shim", _)) => run_mcp_shim().await,
+        Some(("secrets", sub)) => match sub.subcommand() {
+            Some(("migrate", inner)) => run_secrets_migrate(inner),
+            _ => Err(anyhow::anyhow!(
+                "unknown `secrets` subcommand; expected `migrate`"
+            )),
+        },
         Some(("daemon", _)) => run_daemon().await,
         Some((other, _)) => Err(anyhow::anyhow!("unknown subcommand: {other}")),
         None => run_serve(PathBuf::from("schema.toml")).await,
@@ -372,25 +419,82 @@ fn init_tracing() {
 /// Pick the concrete `LlmProvider` adapter implementing ADR-0025's
 /// selection rules. Returns `None` when no provider is configured
 /// or when the explicit `[llm].provider = "none"` is set.
+///
+/// Per ADR-0031, provider keys are read from the legacy
+/// `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env vars OR from a mode-`0600`
+/// `secrets.toml` next to the global `endpoint.toml`. Env-source is
+/// preferred for backwards compatibility during the 30-day deprecation
+/// window; a `WARN` is emitted on first hit.
 fn resolve_llm_provider(cfg: &SchemaConfig) -> Result<Option<Arc<dyn LlmProvider>>> {
-    use std::env;
-
-    let anthropic_key = env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty());
-    let openai_key = env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty());
+    let keys = resolve_provider_keys()?;
     let model = cfg.llm.model.clone();
     match cfg.llm.provider.as_str() {
         "none" => {
             tracing::info!("llm: provider=none — synthesize tool disabled");
             Ok(None)
         }
-        "anthropic" => build_anthropic(anthropic_key, model, "explicit"),
-        "openai" => build_openai(openai_key, model, "explicit"),
-        "auto" => resolve_auto(anthropic_key, openai_key, model),
+        "anthropic" => build_anthropic(keys.anthropic, model, "explicit"),
+        "openai" => build_openai(keys.openai, model, "explicit"),
+        "auto" => resolve_auto(keys.anthropic, keys.openai, model),
         other => Err(anyhow::anyhow!(
             "[llm] provider = {other:?} is not supported (must be one of \
              \"anthropic\", \"openai\", \"none\", \"auto\")"
         )),
     }
+}
+
+/// Resolved provider keys for this process. Each field is `None` when
+/// neither env nor `secrets.toml` carried a value.
+struct ResolvedProviderKeys {
+    anthropic: Option<String>,
+    openai: Option<String>,
+}
+
+/// Implement the ADR-0031 precedence: env wins, `secrets.toml` is the
+/// fallback. WARN once per process if the env-source actually
+/// contributed (so operators see the deprecation pressure).
+fn resolve_provider_keys() -> Result<ResolvedProviderKeys> {
+    use std::env;
+
+    let env_anthropic = env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty());
+    let env_openai = env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty());
+    if env_anthropic.is_some() || env_openai.is_some() {
+        warn_env_source_once();
+    }
+    let anthropic = match env_anthropic {
+        Some(k) => Some(k),
+        None => read_secret(ProviderId::Anthropic)?,
+    };
+    let openai = match env_openai {
+        Some(k) => Some(k),
+        None => read_secret(ProviderId::OpenAi)?,
+    };
+    Ok(ResolvedProviderKeys { anthropic, openai })
+}
+
+fn read_secret(provider: ProviderId) -> Result<Option<String>> {
+    let path = FileSecretStore::canonical_path()
+        .map_err(|e| anyhow::anyhow!("resolving secrets.toml path: {e}"))?;
+    let store = FileSecretStore::new(path);
+    store
+        .provider_key(provider)
+        .map_err(|e| anyhow::anyhow!("reading secrets.toml: {e}"))
+}
+
+/// One-shot WARN logged the first time the env-source carries a key.
+/// `Once::call_once` makes this cheap to call from every provider
+/// resolution site.
+fn warn_env_source_once() {
+    use std::sync::Once;
+    static WARN_ONCE: Once = Once::new();
+    WARN_ONCE.call_once(|| {
+        tracing::warn!(
+            "secrets: provider key found in process environment; \
+             migrate to ~/Library/Application Support/schema/secrets.toml \
+             (macOS) or ~/.local/state/schema/secrets.toml (Linux). \
+             Env-source is deprecated and will be removed 2026-05-27 (ADR-0031)."
+        );
+    });
 }
 
 fn build_anthropic(
@@ -553,26 +657,27 @@ fn write_global_endpoint_file(path: &Path, bound: &SocketAddr, token: &str) -> R
     Ok(())
 }
 
-/// LLM provider resolution for the shared daemon. Reads
-/// `[llm].provider` indirectly via `SCHEMA_LLM_PROVIDER` env var
-/// (the registry has no `[llm]` section — that's per-project and
-/// would conflict if two projects pinned different providers).
-/// `auto` is the default; explicit pinning is via the env knob,
-/// matching ADR-0023's overlay semantics.
+/// LLM provider resolution for the shared daemon.
+///
+/// Reads `[llm].provider` indirectly via `SCHEMA_LLM_PROVIDER` env var
+/// (the registry has no `[llm]` section — that's per-project and would
+/// conflict if two projects pinned different providers). `auto` is the
+/// default; explicit pinning is via the env knob, matching ADR-0023's
+/// overlay semantics. Provider keys follow the ADR-0031 precedence
+/// (env > `secrets.toml`).
 fn resolve_llm_provider_for_daemon() -> Result<Option<Arc<dyn LlmProvider>>> {
     use std::env;
     let provider = env::var("SCHEMA_LLM_PROVIDER").unwrap_or_else(|_| "auto".to_string());
     let model = env::var("SCHEMA_LLM_MODEL").unwrap_or_default();
-    let anthropic_key = env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty());
-    let openai_key = env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty());
+    let keys = resolve_provider_keys()?;
     match provider.as_str() {
         "none" => {
             tracing::info!("daemon llm: provider=none — synthesize tool disabled across projects");
             Ok(None)
         }
-        "anthropic" => build_anthropic(anthropic_key, model, "explicit"),
-        "openai" => build_openai(openai_key, model, "explicit"),
-        "auto" => resolve_auto(anthropic_key, openai_key, model),
+        "anthropic" => build_anthropic(keys.anthropic, model, "explicit"),
+        "openai" => build_openai(keys.openai, model, "explicit"),
+        "auto" => resolve_auto(keys.anthropic, keys.openai, model),
         other => Err(anyhow::anyhow!(
             "SCHEMA_LLM_PROVIDER={other:?} is not supported (use anthropic / openai / none / auto)"
         )),
@@ -1027,4 +1132,23 @@ fn write_fragment(snippet: &str) -> Result<()> {
 async fn run_mcp_shim() -> Result<()> {
     let endpoint_path = global_endpoint_path()?;
     mcp_shim::run(endpoint_path).await
+}
+
+/// `schema secrets migrate` (ADR-0031). Reads provider keys from the
+/// current process environment and writes them to the canonical
+/// `secrets.toml` with mode `0600`.
+fn run_secrets_migrate(sub: &ArgMatches) -> Result<()> {
+    let inputs = secrets_cli::MigrateInputs {
+        destination: sub.get_one::<PathBuf>("destination").cloned(),
+        force: sub.get_flag("force"),
+    };
+    let dest = secrets_cli::migrate(inputs)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(
+        out,
+        "secrets: wrote {} (mode 0600). Restart the daemon to pick up changes.",
+        dest.display()
+    )?;
+    Ok(())
 }

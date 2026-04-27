@@ -7,3 +7,4 @@
 
 pub mod install;
 pub mod mcp_shim;
+pub mod secrets;
