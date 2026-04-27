@@ -368,3 +368,47 @@ loader for the daemon.
   remediation of pre-existing key exposure is a
   separate operator decision and intentionally **not**
   a precondition of this ADR.
+
+- **2026-04-27 — implemented (read path + factory wiring +
+  migrate verb).** `src/ports.rs` adds the `SecretStore`
+  trait + `ProviderId` enum + `SecretStoreError`.
+  `src/adapters/secrets_toml.rs` implements
+  `FileSecretStore` with version-1 schema, `0600`
+  enforcement (`Refuse` / `Repair` / `Skip` modes), and
+  graceful `None` on missing file/section. `src/main.rs`
+  swaps both `resolve_llm_provider` (per-project
+  `serve`) and `resolve_llm_provider_for_daemon` for a
+  shared `resolve_provider_keys` helper that applies
+  the **ENV > `secrets.toml`** precedence and emits the
+  WARN exactly once per process via
+  `std::sync::Once`. `src/cli/secrets.rs` exposes
+  `migrate` + `migrate_with_pairs`; `schema secrets
+  migrate` clap subcommand renders the canonical TOML
+  with mode-`0600` atomic write. **Renderer audit:** the
+  `cli/templates/launchd-daemon.plist.template` and
+  `systemd-daemon.service.template` already had no
+  `*_API_KEY` literals (the leak observed in
+  `~/Library/LaunchAgents/com.farchanjo.schema.daemon.
+  plist` was added by the operator manually post-install,
+  not by `schema install --daemon`). No template change
+  required for ADR-0031 §"Decision" item 4. **Tests:**
+  9 unit tests on `secrets_toml` + 5 on `secrets` migrate
+  verb; total suite 129 passing, fmt/clippy
+  `-D warnings` green.
+
+- **2026-04-27 — `SIGHUP` runtime hot-rotation deferred.**
+  ADR-0031 §"Decision" item 5 specified `SIGHUP`
+  re-reads `secrets.toml`. The current daemon wires
+  `Arc<dyn LlmProvider>` once at startup (`src/main.rs:
+  run_daemon`); supporting hot-rotation requires
+  changing the daemon to hold `Arc<RwLock<Option<Arc<dyn
+  LlmProvider>>>>` and re-resolving on the signal. That
+  refactor was not cost-justified in this ADR's first
+  implementation slice — operator restart of the daemon
+  (`launchctl kickstart -k gui/$(id -u)/com.farchanjo.
+  schema.daemon`) achieves the same effect and the
+  read-path (factory) is already prepared to pick up
+  the new value on the next process start. A follow-up
+  Evidence entry will pin the SIGHUP refactor when the
+  hot-path matters (e.g., zero-downtime rotation
+  becomes a stated requirement).
