@@ -40,10 +40,11 @@ pointing at the CI check that proves the decision is still in effect.
 | 0016 | [MCP tool description style: verb + example + safety hint](./0016-mcp-tool-description-style.md) | accepted | 2026-04-25 |
 | 0017 | [`mtime + size` short-circuit before `blake3` hash](./0017-mtime-size-shortcircuit.md) | accepted | 2026-04-26 |
 | 0018 | [Embedder CPU cap via process nice](./0018-cap-onnx-threads.md) | accepted | 2026-04-26 |
-| 0019 | [MCP transport: Streamable HTTP via `rmcp` 1.5 + `axum` 0.8](./0019-http-streamable-transport.md) | accepted (supersedes 0002; atomic accept set with 0020+0021) | 2026-04-26 |
-| 0020 | [Permanent service lifecycle: launchd + systemd, one per project](./0020-service-permanent-lifecycle.md) | accepted | 2026-04-26 |
-| 0021 | [Localhost bind + per-project bearer-token auth](./0021-localhost-bearer-auth.md) | accepted | 2026-04-26 |
+| 0019 | [MCP transport: Streamable HTTP via `rmcp` 1.5 + `axum` 0.8](./0019-http-streamable-transport.md) | accepted (process-shape part amended by 0026) | 2026-04-26 |
+| 0020 | [Permanent service lifecycle: launchd + systemd, one per project](./0020-service-permanent-lifecycle.md) | accepted (per-project shape amended by 0026) | 2026-04-26 |
+| 0021 | [Localhost bind + per-project bearer-token auth](./0021-localhost-bearer-auth.md) | accepted (validator shape amended by 0026) | 2026-04-26 |
 | 0022 | [Bench-driven evaluation of `tokio-uring` (D-3, Linux only)](./0022-tokio-uring-bench-evaluation.md) | accepted (gate) | 2026-04-26 |
 | 0023 | [Config resolution: walk-up + ENV overlay](./0023-env-overlay-and-walk-up-config-resolution.md) | accepted | 2026-04-26 |
 | 0024 | [E2E test category in Python (pytest + httpx)](./0024-e2e-tests-python-pytest.md) | accepted | 2026-04-26 |
 | 0025 | [LLM `synthesize` tool + `LlmProvider` port (Anthropic / OpenAI)](./0025-llm-synthesize-tool-and-provider-port.md) | accepted | 2026-04-26 |
+| 0026 | [One shared daemon for all projects, with strict per-project isolation](./0026-shared-multi-project-daemon-with-strict-isolation.md) | accepted (amends 0019/0020/0021; implementation gated on fitness function) | 2026-04-26 |

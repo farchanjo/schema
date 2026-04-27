@@ -369,3 +369,27 @@ friction. Both shapes live in `arch/operations/`.
   for `Authorization` is layered **before** `TraceLayer::new_for_http`
   so structured logs never serialise the bearer. Validation gate
   green (53 tests, fmt, clippy `-D warnings`).
+
+- **2026-04-26 — validator shape amended by ADR-0026.**
+  ADR-0021's `BearerValidator` performs an `eq` check against
+  a single token per process. ADR-0026 (one shared daemon, N
+  projects) requires the validator to be **multi-tenant**:
+  `Map<TokenHash, ProjectId>` populated from the daemon's
+  project registry at startup, refreshed on
+  `schema project register / unregister`. The middleware
+  resolves the bearer to a `project_id`, attaches it to the
+  request extensions, and the MCP handlers route every
+  retrieval call to the matching `ProjectInstance`. Token
+  rotation per restart, `0600` `endpoint.toml` mode,
+  localhost-only bind, `SetSensitiveRequestHeadersLayer`
+  ordering, and the constant-time-comparison follow-up are
+  **all preserved** — they apply per token. New requirements
+  layered in by ADR-0026: (1) the validator must reject any
+  `(token, project_id)` pair where the URL or route declares a
+  different `project_id` than the one bound to the token
+  (defence-in-depth against B.3 hybrid routing mistakes); (2)
+  the canary E2E in ADR-0026 §"Fitness function" is the
+  authoritative test that bearer-A on path-B returns 403, not
+  200-with-empty-results. Implementation gated on the fitness
+  function. See ADR-0026 §"Decision" and ADR-0026 §"Fitness
+  function".

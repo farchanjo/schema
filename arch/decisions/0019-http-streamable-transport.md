@@ -476,3 +476,27 @@ diving into the rmcp source.
   → `endpoint.toml` unlink. Both signals now produce clean
   shutdown with exit code 0. Validation: 39/39 E2E tests green
   on Linux, build VM 2026-04-26.
+
+- **2026-04-26 — process-shape part amended by ADR-0026.**
+  ADR-0019 collapsed N Claude-Code-spawned `schema serve`
+  processes into one HTTP server **per project**, on the
+  observation that two windows on the same project doubled
+  RSS. That decision stands for the **transport** (Streamable
+  HTTP via rmcp 1.5 + axum 0.8, `LocalSessionManager`,
+  `with_stateful_mode(true)`, localhost-only allowed hosts,
+  bearer auth, SIGTERM drain) — none of those are touched.
+  What ADR-0026 amends is the **process boundary**: post-
+  acceptance the workstation runs **one** shared daemon for
+  all projects, opening N `MetadataStore` + `VectorStore`
+  instances keyed by `project_id` (ADR-0008 physical isolation
+  preserved), with strict per-project query isolation enforced
+  by the fitness function in ADR-0026. The "one server per
+  project" framing in this ADR's Y-statement therefore reads
+  as historical for the workstation deployment; the per-
+  project framing remains the right mental model for the
+  **stores and watchers**, which stay one-per-project inside
+  the shared daemon. Implementation gated on the ADR-0026
+  fitness function (two-project canary E2E) being green;
+  until then ADR-0019's per-project process model continues
+  to run in production. See ADR-0026 §"Decision" and
+  ADR-0026 §"Cross-references and follow-ups".

@@ -343,3 +343,33 @@ fitness function is **split** between CI and local validation:
   templates is wired from ADR-0018's `[embedding] nice` config
   field. `ExitTimeOut` (macOS) and `TimeoutStopSec` (Linux) hard-
   coded to 10 seconds per the ADR. Validation gate green.
+
+- **2026-04-26 — per-project shape amended by ADR-0026.**
+  ADR-0020's "one launchd / systemd unit per project" mapping
+  is the part ADR-0026 supersedes. Post-acceptance the
+  workstation runs **one** unit total
+  (`com.farchanjo.schema.daemon` on macOS, `schema-daemon
+  .service` on Linux), serving every registered project.
+  Project membership moves from "implicit, inferred from the
+  unit's `--config` argument" to **explicit registration** via
+  a new CLI verb (`schema project register --config <path>`,
+  `schema project unregister --project-id <id>`,
+  `schema project list`). The registry lives at
+  `~/.local/state/schema/registry.toml` (Linux) or
+  `~/Library/Application Support/schema/registry.toml` (macOS)
+  — daemon-internal state, **not** an operator-edited config.
+  Templates evolve: the per-project `{project_id}` /
+  `{config_path}` substitution slots collapse into one
+  workstation-level unit; per-project `nice` carries over via
+  the registry rather than the `--config` flag. Templates and
+  verbs touched are `src/cli/templates/launchd.plist.template`,
+  `src/cli/templates/systemd.service.template`,
+  `src/cli/install.rs`, plus a new `src/cli/project.rs`.
+  ADR-0014 (install + codesign) is unaffected; the binary is
+  still installed once at `/usr/local/bin/schema` and signed
+  once. ADR-0008 (per-project cache directory) is unaffected;
+  each registered project's cache stays at its
+  `project_id`-keyed path. Implementation gated on the
+  ADR-0026 fitness function; until then the per-project units
+  installed under ADR-0020 stay live. See ADR-0026 §"Decision"
+  and ADR-0026 §"Cross-references".
