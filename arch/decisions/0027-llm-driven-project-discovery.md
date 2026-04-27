@@ -516,3 +516,25 @@ answer to the same question.
   (`tests/e2e/test_adr0027_isolation.py`) flips this from
   "accepted (impl gated)" to "accepted (live)" once green in
   CI on the cutover PR.
+
+- **2026-04-26 — refactor PR #1 of 4 landed (this commit).**
+  Operator-facing CLI surface for the (now-superseded)
+  registry deleted. ADR-0026 slice 3 reverted in full.
+  - `src/cli/project.rs` removed (entire file).
+  - `src/cli/mod.rs` no longer declares the module.
+  - `src/main.rs`: `project_subcommand`, `run_project`, the
+    `cli_project` import, the `Some(("project", sub))`
+    dispatch arm, and the trailing `.clone()` on the last
+    `mcp_config_subcommand` argument all removed (the
+    latter caught by `clippy::redundant_clone` once the
+    `project_subcommand` consumer disappeared).
+  - `Registry` struct and `MultiTenantBearerValidator` /
+    `ProjectTokenRegistry` (slice 1, slice 2a) **kept for
+    now** — the next refactor PR rewrites the daemon path
+    and removes them in the same change so each
+    intermediate commit compiles (Daemon::wire still
+    consumes `&Registry`; ripping that out alone produces
+    a non-compiling tree).
+  - 103 unit tests pass (was 110; -7 from the deleted
+    `cli/project.rs` tests). 5 integration. Strict-lint
+    gate green; `cargo fmt --all -- --check` clean.
