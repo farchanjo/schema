@@ -150,8 +150,31 @@ hand. The tool returns a flat `Vec<String>` of source paths.
 
 ## More information
 
-- `src/mcp/server.rs` — tool implementations.
-- ADR-0002 — rmcp transport (the tool dispatch layer).
+- `src/adapters/mcp_server.rs` — tool implementations (post-ADR-0019
+  layout; was `src/mcp/server.rs`).
+- ADR-0019 — Streamable HTTP transport (the tool dispatch layer;
+  supersedes ADR-0002 stdio).
 - ADR-0003 — multi-project architecture (the constraint that
   forced generic tools).
-- ADR-0006 — LanceDB store ops powering the tools.
+- ADR-0011 — sqlite-vec store ops powering the tools (supersedes
+  ADR-0006 LanceDB).
+
+## Evidence and amendments
+
+- **2026-04-26 — `workspace_context` tool registered** (motivated by
+  ADR-0023). Surface answer to "where am I?" so the LLM does not have
+  to guess project boundaries when ENV overlay or `.mcp.json`
+  misconfiguration would otherwise hide the active config.
+  Returns a `WorkspaceContext` struct with three nested objects:
+  `project` (name, id, version, root, cache_dir), `corpus` (list of
+  `{path, kind}`), and `embedding` (model, dims). No arguments.
+  Schema declared at `src/adapters/mcp_server.rs::WorkspaceContext`
+  via `schemars::JsonSchema` derive — rmcp publishes it on
+  `tools/list`. Tool description, per ADR-0016, leads with the
+  imperative: *"Returns project context for this schema MCP server
+  ... Useful as a sanity check at session start ..."*. Validation
+  gate green; tool count: **9** (was 8).
+- **Tool catalogue (post-2026-04-26):** `ping`, `workspace_context`,
+  `query`, `find_decisions`, `glossary_lookup`, `cross_reference`,
+  `list_corpus`, `reset_index`, `forget_source`. Generic-tools
+  posture (ADR-0003) preserved — no domain-specific knobs.

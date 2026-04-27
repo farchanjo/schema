@@ -1,0 +1,4 @@
+# E2E test deps (ADR-0024). Pinned to majors so a `pip install` lock
+# does not drift silently.
+pytest>=8.0,<9.0
+httpx>=0.27,<0.29

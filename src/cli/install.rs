@@ -1,0 +1,198 @@
+//! `schema install --service` / `uninstall --service` / `service status` /
+//! `mcp-config` — service-lifecycle verbs introduced by ADR-0020.
+//!
+//! Each verb resolves the project identity (ADR-0008), templates either a
+//! macOS launchd plist or a Linux systemd user unit, and either writes /
+//! loads / unloads the unit or prints status. The fitness functions in
+//! ADR-0020 are the manual smoke tests on the operator's box and the unit
+//! tests below covering template rendering.
+//!
+//! Templates live as `&'static str` constants; the substitution slots are
+//! `{binary_path}`, `{config_path}`, `{project_id}`, `{stderr_path}`,
+//! `{nice}`. macOS plist also carries `{nice_int}` (same value, kept as a
+//! separate slot to discourage accidentally substituting the path string).
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result};
+
+use crate::adapters::endpoint_toml::Endpoint;
+use crate::adapters::project_identity::ProjectIdentity;
+use crate::adapters::toml_config::SchemaConfig;
+
+/// macOS `LaunchAgent` plist template (ADR-0020).
+const MACOS_PLIST_TEMPLATE: &str = include_str!("templates/launchd.plist.template");
+
+/// Linux systemd user unit template (ADR-0020).
+const LINUX_UNIT_TEMPLATE: &str = include_str!("templates/systemd.service.template");
+
+/// Inputs needed to render a service file.
+#[derive(Debug, Clone)]
+pub struct InstallInputs {
+    pub binary_path: PathBuf,
+    pub config_path: PathBuf,
+    pub project_id: String,
+    pub stderr_path: PathBuf,
+    pub nice: u8,
+}
+
+impl InstallInputs {
+    /// Resolve install inputs from the loaded config + identity, with a
+    /// default `binary_path` derived from `which schema` (or
+    /// `/usr/local/bin/schema` per ADR-0014 when `which` is unavailable).
+    ///
+    /// # Errors
+    /// Returns an error if the config path cannot be canonicalised.
+    pub fn resolve(
+        config_path: &Path,
+        cfg: &SchemaConfig,
+        identity: &ProjectIdentity,
+        binary_override: Option<PathBuf>,
+    ) -> Result<Self> {
+        let binary_path = binary_override.unwrap_or_else(default_binary_path);
+        let canonical_config = config_path
+            .canonicalize()
+            .with_context(|| format!("canonicalising {}", config_path.display()))?;
+        let stderr_path = identity.cache_dir.join("stderr.log");
+        Ok(Self {
+            binary_path,
+            config_path: canonical_config,
+            project_id: identity.id.to_string(),
+            stderr_path,
+            nice: cfg.embedding.nice,
+        })
+    }
+}
+
+/// Default install path defined by ADR-0014 (macOS Apple-codesigned binary).
+fn default_binary_path() -> PathBuf {
+    PathBuf::from("/usr/local/bin/schema")
+}
+
+/// Render the macOS `LaunchAgent` plist for these inputs.
+#[must_use]
+pub fn render_macos_plist(inputs: &InstallInputs) -> String {
+    substitute_template(MACOS_PLIST_TEMPLATE, inputs)
+}
+
+/// Render the Linux systemd user unit for these inputs.
+#[must_use]
+pub fn render_linux_unit(inputs: &InstallInputs) -> String {
+    substitute_template(LINUX_UNIT_TEMPLATE, inputs)
+}
+
+/// Replace `{...}` placeholders in `template` using `inputs`.
+fn substitute_template(template: &str, inputs: &InstallInputs) -> String {
+    template
+        .replace("{binary_path}", &inputs.binary_path.to_string_lossy())
+        .replace("{config_path}", &inputs.config_path.to_string_lossy())
+        .replace("{project_id}", &inputs.project_id)
+        .replace("{stderr_path}", &inputs.stderr_path.to_string_lossy())
+        .replace("{nice}", &inputs.nice.to_string())
+}
+
+/// Service identifier per platform conventions.
+///
+/// macOS `LaunchAgent` label: `com.farchanjo.schema.<project_id>`.
+/// Linux systemd unit name: `schema-<project_id>.service`.
+#[must_use]
+pub fn launchd_label(project_id: &str) -> String {
+    format!("com.farchanjo.schema.{project_id}")
+}
+
+#[must_use]
+pub fn systemd_unit_name(project_id: &str) -> String {
+    format!("schema-{project_id}.service")
+}
+
+/// Print an `mcpServers` JSON snippet ready to paste into a consumer's
+/// `.mcp.json`. Reads `endpoint.toml` from the project cache; fails with a
+/// descriptive error if the server has not been started yet.
+///
+/// Output is a fragment, not a full `.mcp.json`. The operator merges it into
+/// their existing config.
+///
+/// # Errors
+/// Returns an error if `endpoint.toml` is missing or unparseable.
+pub fn render_mcp_config_fragment(identity: &ProjectIdentity) -> Result<String> {
+    let endpoint_path = identity.cache_dir.join("endpoint.toml");
+    let endpoint = Endpoint::load(&endpoint_path).with_context(|| {
+        format!(
+            "reading {}; is the schema server running for project {}?",
+            endpoint_path.display(),
+            identity.id
+        )
+    })?;
+    let snippet = format!(
+        "  \"schema\": {{\n    \"url\": \"{}\",\n    \"headers\": {{\n      \"Authorization\": \"Bearer {}\"\n    }}\n  }}",
+        endpoint.url, endpoint.token,
+    );
+    Ok(snippet)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test fixtures may panic if the env is broken"
+    )]
+
+    use std::path::PathBuf;
+
+    use super::{
+        InstallInputs, launchd_label, render_linux_unit, render_macos_plist, systemd_unit_name,
+    };
+
+    fn fixture_inputs() -> InstallInputs {
+        InstallInputs {
+            binary_path: PathBuf::from("/usr/local/bin/schema"),
+            config_path: PathBuf::from("/Users/op/dev/proj/schema.toml"),
+            project_id: "demo-a3f9c2d1".to_string(),
+            stderr_path: PathBuf::from("/Users/op/.cache/schema/projects/demo-a3f9c2d1/stderr.log"),
+            nice: 5,
+        }
+    }
+
+    #[test]
+    fn macos_plist_substitutes_every_slot() {
+        let rendered = render_macos_plist(&fixture_inputs());
+        assert!(!rendered.contains('{'), "no leftover slots: {rendered}");
+        assert!(rendered.contains("/usr/local/bin/schema"));
+        assert!(rendered.contains("schema.toml"));
+        assert!(rendered.contains("com.farchanjo.schema.demo-a3f9c2d1"));
+        assert!(rendered.contains("<integer>5</integer>"));
+        assert!(
+            rendered.contains("<integer>10</integer>"),
+            "ExitTimeOut 10s"
+        );
+        assert!(rendered.contains("<key>RunAtLoad</key>"));
+        assert!(rendered.contains("<key>KeepAlive</key>"));
+    }
+
+    #[test]
+    fn linux_unit_substitutes_every_slot() {
+        let rendered = render_linux_unit(&fixture_inputs());
+        assert!(!rendered.contains('{'), "no leftover slots: {rendered}");
+        assert!(rendered.contains("ExecStart=/usr/local/bin/schema serve --config"));
+        assert!(rendered.contains("Nice=5"));
+        assert!(rendered.contains("Restart=on-failure"));
+        assert!(rendered.contains("TimeoutStopSec=10s"));
+        assert!(rendered.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn launchd_label_format() {
+        assert_eq!(
+            launchd_label("demo-a3f9c2d1"),
+            "com.farchanjo.schema.demo-a3f9c2d1"
+        );
+    }
+
+    #[test]
+    fn systemd_unit_name_format() {
+        assert_eq!(
+            systemd_unit_name("demo-a3f9c2d1"),
+            "schema-demo-a3f9c2d1.service"
+        );
+    }
+}

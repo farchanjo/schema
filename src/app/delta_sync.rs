@@ -23,7 +23,7 @@ use tracing::{info, warn};
 
 use crate::adapters::metadata_store::{file_content_hash, file_mtime};
 use crate::adapters::toml_config::SchemaConfig;
-use crate::domain::{Chunk, CorpusKind, DiscoveredFile, FileMeta, Metadata};
+use crate::domain::{ChangeOutcome, Chunk, CorpusKind, DiscoveredFile, FileMeta, Metadata};
 use crate::ports::{Chunker, Embedder, MetadataStore, Persistence, Walker};
 
 /// Summary of what a sync pass did.
@@ -209,8 +209,12 @@ fn compute_removed(metadata: &Metadata, on_disk: &BTreeSet<String>) -> Vec<Strin
         .collect()
 }
 
-/// Classify `file` against the persisted manifest: bump the matching `report`
-/// counter and, when re-embedding is needed, push a [`ReindexJob`].
+/// Application-service orchestrator around the domain decision
+/// [`Metadata::classify`].
+///
+/// ADR-0017 short-circuit semantics live entirely on the domain side —
+/// see [`Metadata::classify`]. This function only does I/O and
+/// translation.
 fn classify_file(
     file: &DiscoveredFile,
     metadata: &Metadata,
@@ -218,27 +222,67 @@ fn classify_file(
     to_reindex: &mut Vec<ReindexJob>,
 ) -> anyhow::Result<()> {
     let mtime = file_mtime(&file.absolute_path)?;
+    let size_bytes = file.size_bytes;
+
+    if matches!(
+        metadata.classify(&file.relative_path, mtime, size_bytes, None),
+        ChangeOutcome::UnchangedByMetadata,
+    ) {
+        report.files_unchanged += 1;
+        return Ok(());
+    }
+
     let hash = file_content_hash(&file.absolute_path)?;
     let new_meta = FileMeta {
         mtime,
-        size_bytes: file.size_bytes,
+        size_bytes,
         content_hash: hash.clone(),
         chunk_count: 0,
     };
-    match metadata.get(&file.relative_path) {
-        Some(existing) if existing.content_hash == hash => {
-            report.files_unchanged += 1;
-        }
-        Some(_) => {
-            report.files_modified += 1;
-            to_reindex.push(reindex_job(file, new_meta));
-        }
-        None => {
+    apply_hashed_outcome(file, metadata, &hash, new_meta, report, to_reindex);
+    Ok(())
+}
+
+/// Translate the second-pass (hash-aware) [`ChangeOutcome`] into a
+/// counter bump and, when applicable, a reindex job. Pure mapping —
+/// extracted from `classify_file` to honour the project's 30-line
+/// function ceiling and to keep the domain dispatch readable.
+fn apply_hashed_outcome(
+    file: &DiscoveredFile,
+    metadata: &Metadata,
+    hash: &str,
+    new_meta: FileMeta,
+    report: &mut SyncReport,
+    to_reindex: &mut Vec<ReindexJob>,
+) {
+    match metadata.classify(
+        &file.relative_path,
+        new_meta.mtime,
+        new_meta.size_bytes,
+        Some(hash),
+    ) {
+        ChangeOutcome::New => {
             report.files_added += 1;
             to_reindex.push(reindex_job(file, new_meta));
         }
+        ChangeOutcome::Modified => {
+            report.files_modified += 1;
+            to_reindex.push(reindex_job(file, new_meta));
+        }
+        ChangeOutcome::UnchangedByHash => {
+            // mtime/size drifted but content is byte-identical — touch
+            // event, no reindex.
+            report.files_unchanged += 1;
+        }
+        ChangeOutcome::UnchangedByMetadata => {
+            // Filtered by `classify_file`'s first-pass call. Reaching
+            // this branch would be a domain-logic regression.
+            unreachable!(
+                "UnchangedByMetadata must be filtered by the first \
+                 metadata.classify(..., None) call"
+            )
+        }
     }
-    Ok(())
 }
 
 fn reindex_job(file: &DiscoveredFile, meta: FileMeta) -> ReindexJob {
@@ -600,5 +644,50 @@ mod tests {
             assert!(["a.md", "b.md"].contains(&rel.as_str()));
             assert_eq!(fm.chunk_count, 1);
         }
+    }
+
+    /// ADR-0017 fitness function — running `delta_sync.run()` twice with no
+    /// changes between runs must report **all files unchanged** on the second
+    /// pass and append **zero new rows** to persistence. This proves the
+    /// `mtime + size` short-circuit fires on every file (no reindex jobs
+    /// pushed) and that no behavioural regression slipped in.
+    #[tokio::test]
+    async fn delta_sync_idle_re_run_skips_every_file() {
+        let tmp = TempDir::new().unwrap();
+        let (sync, persistence, _metadata) = build_fake_suite(tmp.path());
+
+        // First pass: populates manifest, appends rows.
+        let first = sync.run().await.unwrap();
+        assert_eq!(first.files_added, 2);
+        assert_eq!(first.files_unchanged, 0);
+        let rows_after_first = {
+            let rows = persistence.rows.lock().unwrap();
+            rows.len()
+        };
+        assert_eq!(rows_after_first, 2);
+
+        // Second pass: same files, no changes on disk → every file must
+        // short-circuit through the manifest check, no reindex jobs.
+        let second = sync.run().await.unwrap();
+        assert_eq!(second.files_total, 2);
+        assert_eq!(second.files_unchanged, 2, "ADR-0017 short-circuit");
+        assert_eq!(second.files_added, 0);
+        assert_eq!(second.files_modified, 0);
+        assert_eq!(second.files_removed, 0);
+        assert_eq!(
+            second.chunks_indexed, 0,
+            "second pass must not re-embed any file"
+        );
+
+        // Persistence rows must not have grown — `apply_deletions` does not
+        // delete unchanged paths, so `rows_after_second == rows_after_first`.
+        let rows_after_second = {
+            let rows = persistence.rows.lock().unwrap();
+            rows.len()
+        };
+        assert_eq!(
+            rows_after_second, rows_after_first,
+            "no new rows on idle re-run"
+        );
     }
 }

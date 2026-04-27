@@ -1,11 +1,23 @@
 ---
-status: accepted
+status: superseded by ADR-0019
 date: 2026-04-25
 decision-makers: ["Fabricio Archanjo"]
 review-due: 2027-04-25
+superseded-by: ["ADR-0019"]
 ---
 
 # 0002 — rmcp 1.5 over stdio for MCP transport
+
+> **Superseded by [ADR-0019](./0019-http-streamable-transport.md).** On
+> 2026-04-26 the operator-observed cost of multiple Claude Code sessions
+> spawning duplicate `schema serve` processes (each loading a ~2 GB
+> ONNX session and running an independent watcher + delta-sync) made
+> the 1:1 client-server stdio mapping the dominant cause of CPU and
+> RAM saturation. ADR-0019 replaces the stdio transport with **MCP
+> Streamable HTTP via `rmcp` 1.5 + `axum` 0.8**, collapsing N
+> processes per project into one HTTP server. The decision body
+> below is preserved for historical context; the active transport
+> choice is recorded in ADR-0019.
 
 > **Y-statement** — In the context of needing a Rust implementation of
 > the Model Context Protocol that Claude Code (and other MCP clients)

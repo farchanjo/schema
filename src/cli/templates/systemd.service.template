@@ -1,0 +1,15 @@
+[Unit]
+Description=schema MCP server for project {project_id}
+After=default.target
+
+[Service]
+Type=simple
+ExecStart={binary_path} serve --config {config_path}
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=10s
+Nice={nice}
+StandardError=append:{stderr_path}
+
+[Install]
+WantedBy=default.target

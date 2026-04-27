@@ -139,4 +139,143 @@ impl Metadata {
     pub fn get(&self, relative_path: &Path) -> Option<&FileMeta> {
         self.files.get(&relative_path.to_string_lossy().to_string())
     }
+
+    /// Domain specification (DDD): classify a freshly-observed file
+    /// against this manifest, **without I/O**. The caller probes the
+    /// filesystem for `mtime` / `size_bytes` (cheap), and only computes
+    /// `hash_if_computed` (expensive `blake3` over file content) when
+    /// the metadata short-circuit fails.
+    ///
+    /// ADR-0017 short-circuit lives here, not in the application
+    /// service: it is a domain decision about how the manifest
+    /// classifies file changes. `delta_sync::classify_file` becomes a
+    /// thin orchestrator around this method.
+    #[must_use]
+    pub fn classify(
+        &self,
+        relative_path: &Path,
+        mtime: i64,
+        size_bytes: u64,
+        hash_if_computed: Option<&str>,
+    ) -> ChangeOutcome {
+        match self.get(relative_path) {
+            None => ChangeOutcome::New,
+            Some(existing) if existing.mtime == mtime && existing.size_bytes == size_bytes => {
+                ChangeOutcome::UnchangedByMetadata
+            }
+            Some(existing) if hash_if_computed.is_some_and(|h| h == existing.content_hash) => {
+                ChangeOutcome::UnchangedByHash
+            }
+            Some(_) => ChangeOutcome::Modified,
+        }
+    }
+}
+
+/// Domain enum (Value Object): outcome of [`Metadata::classify`].
+///
+/// Pure tag; no I/O involved. The application service maps each variant
+/// to a counter bump on `SyncReport` plus a reindex-job push when needed.
+/// Adding a variant is a domain-shape change and requires updating every
+/// match site (rustc enforces that via `#[non_exhaustive]` deliberately
+/// **not** applied here — the enum is closed by design).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeOutcome {
+    /// File is new — not present in the manifest.
+    New,
+    /// `mtime + size` agree with the manifest entry; ADR-0017
+    /// short-circuit fires, no hash needed.
+    UnchangedByMetadata,
+    /// `mtime` or `size` differ but a recomputed hash matches the
+    /// manifest's `content_hash`. The file was touched (e.g., `touch`,
+    /// editor save-without-edit) but its content is identical.
+    UnchangedByHash,
+    /// Hash differs from the manifest entry — file content changed and
+    /// re-embedding is required.
+    Modified,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test fixtures may panic if the env is broken"
+    )]
+
+    use super::{ChangeOutcome, FileMeta, Metadata};
+    use std::path::PathBuf;
+
+    fn meta(mtime: i64, size: u64, hash: &str) -> FileMeta {
+        FileMeta {
+            mtime,
+            size_bytes: size,
+            content_hash: hash.to_string(),
+            chunk_count: 1,
+        }
+    }
+
+    fn manifest_with(path: &str, fm: FileMeta) -> Metadata {
+        let mut m = Metadata::default();
+        m.upsert(&PathBuf::from(path), fm);
+        m
+    }
+
+    /// ADR-0013 §"DDD Specification" + ADR-0017 short-circuit:
+    /// when the path is unknown, classification is `New`. No hash
+    /// is consulted (caller is allowed to pass `None`).
+    #[test]
+    fn classify_new_path_returns_new() {
+        let manifest = Metadata::default();
+        assert_eq!(
+            manifest.classify(&PathBuf::from("doc.md"), 100, 200, None),
+            ChangeOutcome::New
+        );
+    }
+
+    /// ADR-0017 fitness — same `(mtime, size)` short-circuits to
+    /// `UnchangedByMetadata` and the caller never has to compute a
+    /// hash.
+    #[test]
+    fn classify_matching_mtime_size_short_circuits() {
+        let manifest = manifest_with("doc.md", meta(100, 200, "deadbeef"));
+        assert_eq!(
+            manifest.classify(&PathBuf::from("doc.md"), 100, 200, None),
+            ChangeOutcome::UnchangedByMetadata
+        );
+    }
+
+    /// `mtime` differs but recomputed hash matches → `UnchangedByHash`
+    /// (touched but content-identical).
+    #[test]
+    fn classify_mtime_drifted_but_hash_matches_unchanged_by_hash() {
+        let manifest = manifest_with("doc.md", meta(100, 200, "deadbeef"));
+        assert_eq!(
+            manifest.classify(&PathBuf::from("doc.md"), 999, 200, Some("deadbeef")),
+            ChangeOutcome::UnchangedByHash
+        );
+    }
+
+    /// Size changed → hash must differ (mathematically possible to
+    /// match but rare); caller passes computed hash; classifies as
+    /// `Modified`.
+    #[test]
+    fn classify_size_changed_with_new_hash_returns_modified() {
+        let manifest = manifest_with("doc.md", meta(100, 200, "deadbeef"));
+        assert_eq!(
+            manifest.classify(&PathBuf::from("doc.md"), 100, 250, Some("aaaa1111")),
+            ChangeOutcome::Modified
+        );
+    }
+
+    /// Hash absent + mtime/size disagree → still `Modified`. Caller is
+    /// expected to recompute hash next; this branch covers the case
+    /// where the caller is probing without yet having the hash and
+    /// wants to learn whether to spend the cost.
+    #[test]
+    fn classify_drifted_without_hash_returns_modified() {
+        let manifest = manifest_with("doc.md", meta(100, 200, "deadbeef"));
+        assert_eq!(
+            manifest.classify(&PathBuf::from("doc.md"), 999, 250, None),
+            ChangeOutcome::Modified
+        );
+    }
 }

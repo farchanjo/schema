@@ -8,4 +8,5 @@
 pub mod cleanup;
 pub mod delta_sync;
 pub mod query;
+pub mod synthesize;
 pub mod watcher_consumer;

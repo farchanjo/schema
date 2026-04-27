@@ -7,11 +7,15 @@
 //! module is a *driving* adapter (it adapts incoming MCP RPCs); the rest are
 //! driven adapters.
 
+pub mod anthropic_provider;
+pub mod auth;
+pub mod endpoint_toml;
 pub mod fastembed_embedder;
 pub mod filesystem;
 pub mod markdown_chunker;
 pub mod mcp_server;
 pub mod metadata_store;
+pub mod openai_provider;
 pub mod project_identity;
 pub mod sqlite_vec_store;
 pub mod toml_config;

@@ -232,7 +232,7 @@ mod tests {
     )]
     use super::*;
     use crate::adapters::toml_config::{
-        Corpus, EmbeddingConfig, ProjectMeta, RetrievalConfig, SecurityConfig,
+        Corpus, EmbeddingConfig, LlmConfig, ProjectMeta, RetrievalConfig, SecurityConfig,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -252,6 +252,7 @@ mod tests {
             embedding: EmbeddingConfig::default(),
             retrieval: RetrievalConfig::default(),
             security: SecurityConfig::default(),
+            llm: LlmConfig::default(),
         }
     }
 

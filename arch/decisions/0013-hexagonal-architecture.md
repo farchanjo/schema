@@ -362,3 +362,64 @@ stays at 20. Lint gate stays at exit 0.
   Not blocking — the leak is one helper module, scope is
   limited, and the fitness function still holds for the
   ADR-0011 swap which was the primary goal._
+
+- **2026-04-26 — Architectural patterns audit.** This ADR's
+  Hexagonal layout coexists with a tactical-DDD vocabulary
+  and a small set of GoF idioms. Documenting the overlap so
+  future readers know which patterns are load-bearing.
+
+  ### DDD tactical patterns observed
+
+  | Pattern | Where |
+  |---|---|
+  | **Value Object** | `domain::Chunk`, `domain::ChunkRecord`, `domain::FileMeta`, `domain::DiscoveredFile`, `domain::CorpusEvent`, `adapters::endpoint_toml::Endpoint`, `adapters::project_identity::ProjectId` — all immutable, equality by content. |
+  | **Repository** | `ports::Persistence` (chunks store), `ports::MetadataStore` (manifest store) — both async traits with CRUD-shaped methods. |
+  | **Application Service** | `app::query::Query`, `app::cleanup::Cleanup`, `app::delta_sync::DeltaSync`, `app::watcher_consumer` — each orchestrates ports without leaking adapter detail. |
+  | **Specification** | `domain::Metadata::classify` returns a `ChangeOutcome` enum (`New`, `UnchangedByMetadata`, `UnchangedByHash`, `Modified`); `delta_sync::classify_file` orchestrates I/O around this pure decision. ADR-0017 short-circuit logic now lives in the domain layer. |
+  | **Factory Method** | `SchemaServer::with_state`, `SqliteVecStore::open`, `FastembedEmbedder::new_bge_m3`, `BearerValidator::new`, `Endpoint::write_atomic`. |
+  | **Anti-Corruption Layer** | not present — no legacy system to shield from. |
+  | **Aggregate Root** | not enforced ceremonially; `Metadata` is the closest (manages `FileMeta` children) but the invariants are simple enough that tactical Value Object + Repository covers the case. Re-evaluate if invariants grow. |
+  | **Domain Event** | `CorpusEvent` is shaped like a domain event but used as a tokio `mpsc` payload, not dispatched on a bus. No event sourcing. Out of scope for FASE 1.0. |
+
+  ### DDD strategic — single bounded context
+
+  The crate is one bounded context: "schema corpus indexer".
+  The ubiquitous language is the glossary embedded in
+  `domain.rs` plus the ADR vocabulary (chunk, corpus,
+  project_id, artifact_id, manifest, endpoint, session).
+  Multi-context evaluation is deferred until a second
+  consumer-facing surface emerges (e.g., a separate
+  daemon for telemetry / fleet coordination — none today).
+
+  ### GoF idiomatic application
+
+  | Pattern | Where | Rust shape |
+  |---|---|---|
+  | **Adapter** | every file in `src/adapters/` | `impl Trait for ConcreteType` |
+  | **Decorator / Chain of Responsibility** | `build_router` tower stack: `ValidateRequestHeaderLayer` → `SetSensitiveRequestHeadersLayer` → `TraceLayer` | `tower::Layer` |
+  | **Factory Method** | constructors prefixed `new_*` / `open` / `with_state` | `pub fn new_*(...) -> Result<Self>` |
+  | **Singleton** | `static REGISTER_VEC: Once` for the one-shot `sqlite-vec` extension load | `std::sync::Once` |
+  | **Strategy** | rmcp `StreamableHttpService::new(\|\| Ok(server.clone()), ...)` factory closure (per-session server creation) | `Fn() -> Result<S>` |
+  | **Command** | each `#[tool]` method on `SchemaServer` (`mcp_server.rs`) | rmcp `#[tool]` macro |
+  | **Facade** | `Query`, `Cleanup` over multiple ports | struct delegating to `Arc<dyn Trait>` fields |
+  | **Bridge** | `Arc<dyn Persistence>` separates `DeltaSync` from concrete `SqliteVecStore` | `Arc<dyn Trait>` |
+  | **Observer** | `NotifyWatcher` → `mpsc::Receiver<CorpusEvent>` consumed by `watcher_consumer` | tokio mpsc |
+  | **Iterator** | `walkdir::WalkDir`, `Vec<Chunk>::iter` | std `Iterator` |
+
+  ### Patterns intentionally NOT used
+
+  - **Builder** — Rust struct literal init plus `Default`
+    covers every constructor in the codebase; no struct
+    has enough optional fields to warrant a builder.
+  - **Abstract Factory** / **Prototype** — single
+    implementation per port; no family of related products.
+  - **Composite** / **Visitor** / **Interpreter** — no
+    object trees that need traversal.
+  - **Memento** — no snapshot/undo semantics.
+  - **Mediator** — too few components; Hexagonal `app`
+    services already mediate via ports.
+  - **State** — no state machines exposed to consumers.
+  - **Flyweight** — no allocation pressure.
+
+  Re-introducing any of these requires a new ADR — they
+  imply complexity the project has consciously avoided.

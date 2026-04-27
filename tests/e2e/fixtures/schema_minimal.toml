@@ -1,0 +1,10 @@
+[project]
+name = "e2e-fixture"
+version = "1"
+
+[[corpus]]
+path = "docs"
+kind = "markdown"
+
+[embedding]
+nice = 5

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.farchanjo.schema.{project_id}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{binary_path}</string>
+        <string>serve</string>
+        <string>--config</string>
+        <string>{config_path}</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>Nice</key>
+    <integer>{nice}</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>10</integer>
+
+    <key>StandardErrorPath</key>
+    <string>{stderr_path}</string>
+
+    <key>StandardOutPath</key>
+    <string>{stderr_path}</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

@@ -235,3 +235,67 @@ cert.
   (the new procedure formalises and codesigns it). The
   current `target/release/schema` build is ad-hoc-signed
   (`linker-signed,adhoc`) and gets re-signed on install._
+
+- **2026-04-26 — Codesign re-ordered: sign IN PLACE at
+  `/usr/local/bin/schema` (not at the cargo output).** Original
+  procedure signed `target/release/schema` and then
+  `sudo install`-copied it to `/usr/local/bin/`. Two practical
+  problems with that order:
+
+  1. The `install` step copies the file. Codesign signatures
+     live in the Mach-O `__TEXT,__signature` section (not in
+     extended attributes), so they survive a plain `cp`/`install`.
+     But some macOS filesystem combinations (APFS → SMB → APFS)
+     and certain `install` flags can drop trailer xattrs on the
+     destination, leading to verify failures. Signing at the
+     destination removes the variable.
+  2. Cargo's output may carry `com.apple.quarantine` (typical
+     after building from a `git clone` of a downloaded zip).
+     That flag survives `install` and triggers Gatekeeper on
+     first run. Signing at the final path with `sudo` (root
+     does not inherit quarantine) gives a clean signature.
+
+  **Revised procedure:**
+
+  ```bash
+  cargo build --release
+  sudo install -m 0755 target/release/schema /usr/local/bin/schema
+  sudo codesign --sign "Apple Development: Fabricio Fonseca (J3LVNXCU3U)" \
+                --options runtime --force \
+                /usr/local/bin/schema
+  codesign --verify --verbose=2 /usr/local/bin/schema
+  ```
+
+  `sudo codesign` is required because `/usr/local/bin/schema`
+  is root-owned. The verify step (no sudo) confirms the
+  signature outside the privileged context — fitness function
+  must still exit 0 with the developer's identity in the
+  Authority chain.
+
+- **2026-04-26 — Codesign explicitly marked optional.** The
+  original ADR text framed codesign as a hard requirement.
+  Realistic posture: codesign + Hardened Runtime is the right
+  default for the primary operator (Apple Development identity
+  available), but the binary runs unsigned just fine —
+  Gatekeeper warns once on first launch and can be cleared
+  with `xattr -d com.apple.quarantine /usr/local/bin/schema`
+  or via right-click → Open. Operators without an Apple
+  identity (CI runners, contributors without a Developer
+  Program subscription, Linux-only builds) skip the codesign
+  step:
+
+  ```bash
+  cargo build --release
+  sudo install -m 0755 target/release/schema /usr/local/bin/schema
+  # codesign skipped; binary runs, Gatekeeper warns once on first launch.
+  ```
+
+  **Caveat for service mode (ADR-0020 launchd).** A LaunchAgent
+  whose `ExecStart` points at an *unsigned* binary loads on
+  current macOS, but the Hardened Runtime flag in the plist
+  (equivalent to `--options runtime`) may have stricter
+  behaviour on a future Gatekeeper release. Operators skipping
+  codesign should drop the Hardened Runtime expectation from
+  the plist or accept that the LaunchAgent may stop loading on
+  a future macOS update. Documented in
+  `arch/operations/runbook.md`.

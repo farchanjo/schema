@@ -1,8 +1,8 @@
 //! `schema` — MCP server for indexing project specs, ADRs, and contracts.
 //!
 //! CLI entrypoint dispatches to subcommands. Default subcommand is `serve`,
-//! starting the MCP server over stdio. `validate` checks `schema.toml` without
-//! starting the server (FASE 1.0 stub).
+//! starting the MCP server over **Streamable HTTP** (ADR-0019; stdio dropped).
+//! `validate` checks `schema.toml` without starting the server.
 
 #![allow(
     unused_crate_dependencies,
@@ -11,29 +11,47 @@
               attribute covers the library; this allows the binary."
 )]
 
+use std::fs;
 use std::io::{self, Write};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use axum::Router;
+use chrono::Utc;
 use clap::{Arg, ArgMatches, Command};
+use tokio::net::TcpListener;
+use tokio::signal::ctrl_c;
+use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use uuid::Uuid;
 
+use schema::adapters::anthropic_provider::AnthropicProvider;
+use schema::adapters::endpoint_toml::Endpoint;
 use schema::adapters::fastembed_embedder::FastembedEmbedder;
 use schema::adapters::filesystem::{NotifyWatcher, WalkdirWalker};
 use schema::adapters::markdown_chunker::MarkdownChunker;
-use schema::adapters::mcp_server::{SchemaServer, ServerState};
+use schema::adapters::mcp_server::{SchemaServer, ServerState, build_router};
 use schema::adapters::metadata_store::TomlMetadataStore;
+use schema::adapters::openai_provider::OpenAiProvider;
 use schema::adapters::project_identity::ProjectIdentity;
 use schema::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_dir};
 use schema::adapters::toml_config::SchemaConfig;
 use schema::app::cleanup::Cleanup;
 use schema::app::delta_sync::{DeltaSync, corpus_paths_from_config};
 use schema::app::query::Query;
+use schema::app::synthesize::Synthesize;
 use schema::app::watcher_consumer::run_watcher_consumer;
-use schema::ports::{Chunker, Embedder, MetadataStore, Persistence, Walker, Watcher};
+use schema::cli::install::{
+    InstallInputs, launchd_label, render_linux_unit, render_macos_plist,
+    render_mcp_config_fragment, systemd_unit_name,
+};
+use schema::ports::{Chunker, Embedder, LlmProvider, MetadataStore, Persistence, Walker, Watcher};
 
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(500);
 
@@ -52,7 +70,7 @@ fn cli() -> Command {
         .arg_required_else_help(false)
         .subcommand(
             Command::new("serve")
-                .about("Start the MCP server over stdio.")
+                .about("Start the MCP server over Streamable HTTP (ADR-0019).")
                 .arg(config_arg.clone()),
         )
         .subcommand(
@@ -61,7 +79,11 @@ fn cli() -> Command {
                 .arg(config_arg.clone()),
         )
         .subcommand(reset_subcommand(config_arg.clone()))
-        .subcommand(forget_subcommand(config_arg))
+        .subcommand(forget_subcommand(config_arg.clone()))
+        .subcommand(install_subcommand(config_arg.clone()))
+        .subcommand(uninstall_subcommand(config_arg.clone()))
+        .subcommand(service_subcommand(config_arg.clone()))
+        .subcommand(mcp_config_subcommand(config_arg))
 }
 
 /// Shared `--config` argument used by every subcommand.
@@ -104,6 +126,65 @@ fn forget_subcommand(config_arg: Arg) -> Command {
         )
 }
 
+/// `schema install --service --config X [--binary-path Y]` (ADR-0020).
+fn install_subcommand(config_arg: Arg) -> Command {
+    Command::new("install")
+        .about(
+            "Render and install the per-project service unit (launchd plist on macOS; systemd user unit on Linux). Requires --service flag (ADR-0020).",
+        )
+        .arg(config_arg)
+        .arg(
+            Arg::new("service")
+                .long("service")
+                .action(clap::ArgAction::SetTrue)
+                .required(true)
+                .help("Confirm install of the OS service unit (no other install variant exists yet)."),
+        )
+        .arg(
+            Arg::new("binary-path")
+                .long("binary-path")
+                .value_name("PATH")
+                .value_parser(clap::value_parser!(PathBuf))
+                .help("Override the binary path written into the unit (default: /usr/local/bin/schema per ADR-0014)."),
+        )
+}
+
+/// `schema uninstall --service --config X` (ADR-0020).
+fn uninstall_subcommand(config_arg: Arg) -> Command {
+    Command::new("uninstall")
+        .about("Remove the per-project service unit installed by `schema install --service` (ADR-0020).")
+        .arg(config_arg)
+        .arg(
+            Arg::new("service")
+                .long("service")
+                .action(clap::ArgAction::SetTrue)
+                .required(true)
+                .help("Confirm uninstall of the OS service unit."),
+        )
+}
+
+/// `schema service status --config X` (ADR-0020).
+fn service_subcommand(config_arg: Arg) -> Command {
+    Command::new("service")
+        .about("Inspect the running per-project service (ADR-0020).")
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .subcommand(
+            Command::new("status")
+                .about("Print URL, token, and lifecycle hints for the running server.")
+                .arg(config_arg),
+        )
+}
+
+/// `schema mcp-config --config X` (ADR-0021 helper).
+fn mcp_config_subcommand(config_arg: Arg) -> Command {
+    Command::new("mcp-config")
+        .about(
+            "Print the `mcpServers` JSON fragment for the running server, ready to paste into a consumer's `.mcp.json` (ADR-0021).",
+        )
+        .arg(config_arg)
+}
+
 fn config_from(matches: &ArgMatches) -> PathBuf {
     matches
         .get_one::<PathBuf>("config")
@@ -128,13 +209,26 @@ async fn main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("--path is required for `schema forget`"))?;
             run_forget(config_from(sub), path).await
         }
+        Some(("install", sub)) => {
+            let binary_override = sub.get_one::<PathBuf>("binary-path").cloned();
+            run_install_service(&config_from(sub), binary_override)
+        }
+        Some(("uninstall", sub)) => run_uninstall_service(&config_from(sub)),
+        Some(("service", sub)) => match sub.subcommand() {
+            Some(("status", inner)) => run_service_status(&config_from(inner)),
+            _ => Err(anyhow::anyhow!(
+                "unknown `service` subcommand; expected `status`"
+            )),
+        },
+        Some(("mcp-config", sub)) => run_mcp_config(&config_from(sub)),
         Some((other, _)) => Err(anyhow::anyhow!("unknown subcommand: {other}")),
         None => run_serve(PathBuf::from("schema.toml")).await,
     }
 }
 
 /// Configure `tracing-subscriber` to read filter from `RUST_LOG` (default: info).
-/// Logs are written to stderr so stdio JSON-RPC is not contaminated.
+/// Logs are written to stderr so launchd / systemd capture them via the
+/// `StandardErrorPath` / `StandardError=` knobs (ADR-0020).
 fn init_tracing() {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::registry()
@@ -183,9 +277,14 @@ struct Services {
     sync: DeltaSync,
     query: Query,
     cleanup: Cleanup,
+    /// `Some` when a cloud LLM provider (Anthropic / `OpenAI`) is wired
+    /// per ADR-0025; `None` triggers the runtime gate on the
+    /// `synthesize` MCP tool (`[DISABLED — set ANTHROPIC_API_KEY or
+    /// OPENAI_API_KEY]`).
+    synthesize: Option<Synthesize>,
 }
 
-fn build_services(wiring: &Wiring) -> Services {
+fn build_services(cfg: &SchemaConfig, wiring: &Wiring) -> Result<Services> {
     let sync = DeltaSync::new(
         Arc::clone(&wiring.persistence),
         Arc::clone(&wiring.embedder),
@@ -201,43 +300,237 @@ fn build_services(wiring: &Wiring) -> Services {
         Arc::clone(&wiring.persistence),
         Arc::clone(&wiring.metadata),
     );
-    Services {
+    let synthesize = build_synthesize(cfg, wiring)?;
+    Ok(Services {
         sync,
         query,
         cleanup,
+        synthesize,
+    })
+}
+
+/// Composition root for the LLM `synthesize` use case (ADR-0025).
+///
+/// Resolves the provider per the rules in ADR-0025 §"Composition root
+/// selection": explicit `[llm].provider` selector when set, otherwise
+/// auto-detect via `*_API_KEY`. `none` (or `auto` with neither key
+/// set) yields `None` — the synthesize tool then runs in disabled
+/// mode at the MCP layer.
+fn build_synthesize(cfg: &SchemaConfig, wiring: &Wiring) -> Result<Option<Synthesize>> {
+    let Some(provider) = resolve_llm_provider(cfg)? else {
+        return Ok(None);
+    };
+    Ok(Some(Synthesize::new(
+        Arc::clone(&wiring.persistence),
+        Arc::clone(&wiring.embedder),
+        provider,
+        cfg.llm.max_tokens,
+        cfg.llm.temperature,
+    )))
+}
+
+/// Pick the concrete `LlmProvider` adapter implementing ADR-0025's
+/// selection rules. Returns `None` when no provider is configured
+/// or when the explicit `[llm].provider = "none"` is set.
+fn resolve_llm_provider(cfg: &SchemaConfig) -> Result<Option<Arc<dyn LlmProvider>>> {
+    use std::env;
+
+    let anthropic_key = env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty());
+    let openai_key = env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty());
+    let model = cfg.llm.model.clone();
+    match cfg.llm.provider.as_str() {
+        "none" => {
+            tracing::info!("llm: provider=none — synthesize tool disabled");
+            Ok(None)
+        }
+        "anthropic" => build_anthropic(anthropic_key, model, "explicit"),
+        "openai" => build_openai(openai_key, model, "explicit"),
+        "auto" => resolve_auto(anthropic_key, openai_key, model),
+        other => Err(anyhow::anyhow!(
+            "[llm] provider = {other:?} is not supported (must be one of \
+             \"anthropic\", \"openai\", \"none\", \"auto\")"
+        )),
+    }
+}
+
+fn build_anthropic(
+    key: Option<String>,
+    model: String,
+    selection: &'static str,
+) -> Result<Option<Arc<dyn LlmProvider>>> {
+    let key = key.ok_or_else(|| {
+        anyhow::anyhow!("[llm] provider = \"anthropic\" but ANTHROPIC_API_KEY is unset")
+    })?;
+    tracing::info!(provider = "anthropic", selection, "llm: provider selected");
+    Ok(Some(Arc::new(AnthropicProvider::new(key, model)?)))
+}
+
+fn build_openai(
+    key: Option<String>,
+    model: String,
+    selection: &'static str,
+) -> Result<Option<Arc<dyn LlmProvider>>> {
+    let key = key.ok_or_else(|| {
+        anyhow::anyhow!("[llm] provider = \"openai\" but OPENAI_API_KEY is unset")
+    })?;
+    tracing::info!(provider = "openai", selection, "llm: provider selected");
+    Ok(Some(Arc::new(OpenAiProvider::new(key, model)?)))
+}
+
+fn resolve_auto(
+    anthropic_key: Option<String>,
+    openai_key: Option<String>,
+    model: String,
+) -> Result<Option<Arc<dyn LlmProvider>>> {
+    match (anthropic_key, openai_key) {
+        (Some(key), None) => build_anthropic(Some(key), model, "auto"),
+        (None, Some(key)) => build_openai(Some(key), model, "auto"),
+        (Some(_), Some(_)) => Err(anyhow::anyhow!(
+            "[llm] provider = \"auto\" but both ANTHROPIC_API_KEY and \
+             OPENAI_API_KEY are set; pin one with [llm] provider = \"anthropic\" \
+             or \"openai\" (or SCHEMA_LLM_PROVIDER)"
+        )),
+        (None, None) => {
+            tracing::info!("llm: no provider key set — synthesize tool disabled");
+            Ok(None)
+        }
     }
 }
 
 async fn run_serve(config: PathBuf) -> Result<()> {
-    let cfg = SchemaConfig::load(&config)?;
-    let identity =
-        ProjectIdentity::resolve(&cfg.project.name, &SchemaConfig::project_root(&config)?)?;
+    let (cfg, identity) = resolve_serve_context(&config)?;
+    let services = wire_serve_services(&cfg, &identity).await?;
+    let endpoint_path = identity.cache_dir.join("endpoint.toml");
+    let state = ServerState {
+        config: cfg,
+        identity,
+        query: services.query,
+        cleanup: services.cleanup,
+        synthesize: services.synthesize,
+    };
+    serve_http(SchemaServer::with_state(state), endpoint_path).await
+}
+
+fn resolve_serve_context(config: &Path) -> Result<(SchemaConfig, ProjectIdentity)> {
+    let (cfg, resolved_config) = SchemaConfig::resolve(Some(config))?;
+    let identity = ProjectIdentity::resolve(
+        &cfg.project.name,
+        &SchemaConfig::project_root(&resolved_config)?,
+    )?;
     identity.ensure_cache_dir()?;
     tracing::info!(
         project = %identity.id,
         cache_dir = %identity.cache_dir.display(),
         "schema config loaded; cache resolved",
     );
+    Ok((cfg, identity))
+}
 
-    let wiring = wire_ports(&cfg, &identity).await?;
-    let Services {
-        sync,
-        query,
-        cleanup,
-    } = build_services(&wiring);
-
-    let initial = sync.run().await?;
+async fn wire_serve_services(cfg: &SchemaConfig, identity: &ProjectIdentity) -> Result<Services> {
+    let wiring = wire_ports(cfg, identity).await?;
+    let services = build_services(cfg, &wiring)?;
+    let initial = services.sync.run().await?;
     tracing::info!(?initial, "initial delta-sync complete");
+    spawn_watcher(cfg, identity, services.sync.clone())?;
+    Ok(services)
+}
 
-    spawn_watcher(&cfg, &identity, sync.clone())?;
+/// Start the Streamable HTTP MCP server (ADR-0019).
+///
+/// Bind `127.0.0.1:0` (kernel chooses port), generate a fresh bearer token
+/// (ADR-0021), write `endpoint.toml` with `0600` permissions, then run
+/// `axum::serve` until SIGTERM / Ctrl-C drains the in-flight sessions.
+async fn serve_http(server: SchemaServer, endpoint_path: PathBuf) -> Result<()> {
+    let listener = bind_localhost_listener().await?;
+    let bound = listener.local_addr()?;
+    tracing::info!(address = %bound, "HTTP MCP listener bound");
 
-    let state = ServerState {
-        config: cfg,
-        identity,
-        query,
-        cleanup,
+    let token = Uuid::new_v4().to_string();
+    write_endpoint_file(&endpoint_path, &bound, &token)?;
+
+    let cancellation = CancellationToken::new();
+    let router = build_router(server, token, cancellation.clone());
+    let serve_result = run_axum_until_shutdown(listener, router, cancellation).await;
+
+    cleanup_endpoint_file(&endpoint_path);
+
+    serve_result
+}
+
+async fn bind_localhost_listener() -> Result<TcpListener> {
+    let bind_addr: SocketAddr = "127.0.0.1:0".parse()?;
+    let listener = TcpListener::bind(bind_addr).await?;
+    Ok(listener)
+}
+
+fn write_endpoint_file(path: &Path, bound: &SocketAddr, token: &str) -> Result<()> {
+    let endpoint = Endpoint {
+        version: 1,
+        url: format!("http://{bound}"),
+        token: token.to_string(),
+        pid: process::id(),
+        started_at: Utc::now().to_rfc3339(),
     };
-    SchemaServer::with_state(state).run_stdio().await
+    endpoint.write_atomic(path)?;
+    tracing::info!(path = %path.display(), "endpoint.toml written (mode 0600)");
+    Ok(())
+}
+
+async fn run_axum_until_shutdown(
+    listener: TcpListener,
+    router: Router,
+    cancellation: CancellationToken,
+) -> Result<()> {
+    let shutdown_signal = async move {
+        wait_for_shutdown_signal().await;
+        tracing::info!("shutdown signal received; cancelling sessions");
+        cancellation.cancel();
+    };
+    axum::serve(listener, router)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .map_err(anyhow::Error::from)
+}
+
+/// Wait for the first of SIGINT (Ctrl-C) or SIGTERM (`kill <pid>`,
+/// launchd `bootout`, systemd `stop`). `tokio::signal::ctrl_c()` only
+/// covers SIGINT; without explicit SIGTERM handling the kernel kills
+/// the process with default action and `endpoint.toml` cleanup never
+/// runs (ADR-0019 evidence amendment 2026-04-26).
+async fn wait_for_shutdown_signal() {
+    let mut sigterm = match signal(SignalKind::terminate()) {
+        Ok(stream) => stream,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to install SIGTERM handler; falling back to SIGINT-only"
+            );
+            if let Err(e) = ctrl_c().await {
+                tracing::warn!(error = %e, "ctrl_c handler failed; cancelling immediately");
+            }
+            return;
+        }
+    };
+    tokio::select! {
+        result = ctrl_c() => {
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "ctrl_c handler failed; cancelling immediately");
+            } else {
+                tracing::info!("SIGINT received");
+            }
+        }
+        _ = sigterm.recv() => {
+            tracing::info!("SIGTERM received");
+        }
+    }
+}
+
+fn cleanup_endpoint_file(path: &Path) {
+    if let Err(e) = Endpoint::remove_quiet(path) {
+        tracing::warn!(error = %e, path = %path.display(), "failed to remove endpoint.toml on shutdown");
+    } else {
+        tracing::info!(path = %path.display(), "endpoint.toml removed on shutdown");
+    }
 }
 
 /// Wire the in-session filesystem watcher (ADR-0010 + ADR-0007 evidence
@@ -262,9 +555,11 @@ fn spawn_watcher(cfg: &SchemaConfig, identity: &ProjectIdentity, sync: DeltaSync
 }
 
 fn run_validate(config: &Path) -> Result<()> {
-    let cfg = SchemaConfig::load(config)?;
-    let identity =
-        ProjectIdentity::resolve(&cfg.project.name, &SchemaConfig::project_root(config)?)?;
+    let (cfg, resolved_config) = SchemaConfig::resolve(Some(config))?;
+    let identity = ProjectIdentity::resolve(
+        &cfg.project.name,
+        &SchemaConfig::project_root(&resolved_config)?,
+    )?;
 
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -287,9 +582,11 @@ fn run_validate(config: &Path) -> Result<()> {
 /// watcher, or the initial delta-sync — those are not meaningful for a
 /// destructive cleanup verb.
 async fn build_cleanup(config: &Path) -> Result<(ProjectIdentity, Cleanup)> {
-    let cfg = SchemaConfig::load(config)?;
-    let identity =
-        ProjectIdentity::resolve(&cfg.project.name, &SchemaConfig::project_root(config)?)?;
+    let (cfg, resolved_config) = SchemaConfig::resolve(Some(config))?;
+    let identity = ProjectIdentity::resolve(
+        &cfg.project.name,
+        &SchemaConfig::project_root(&resolved_config)?,
+    )?;
     identity.ensure_cache_dir()?;
     let wiring = wire_ports(&cfg, &identity).await?;
     let cleanup = Cleanup::new(
@@ -330,5 +627,170 @@ async fn run_forget(config: PathBuf, path: String) -> Result<()> {
     );
     cleanup.forget_source(&path).await?;
     tracing::info!(project = %identity.id, path = %path, "schema forget complete");
+    Ok(())
+}
+
+/// Resolve the path the rendered service unit lives at on the current OS.
+fn service_unit_path(project_id: &str) -> Result<PathBuf> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("home dir not resolvable"))?;
+    if cfg!(target_os = "macos") {
+        Ok(home
+            .join("Library/LaunchAgents")
+            .join(format!("{}.plist", launchd_label(project_id))))
+    } else {
+        Ok(home
+            .join(".config/systemd/user")
+            .join(systemd_unit_name(project_id)))
+    }
+}
+
+/// Render the per-OS template and write it to disk; print the operator
+/// command needed to actually load the unit (we deliberately do *not* shell
+/// out to `launchctl bootstrap` / `systemctl --user` so this verb stays
+/// runnable in headless / CI contexts).
+fn run_install_service(config: &Path, binary_override: Option<PathBuf>) -> Result<()> {
+    let (cfg, resolved_config) = SchemaConfig::resolve(Some(config))?;
+    let identity = ProjectIdentity::resolve(
+        &cfg.project.name,
+        &SchemaConfig::project_root(&resolved_config)?,
+    )?;
+    identity.ensure_cache_dir()?;
+    let project_id = identity.id.to_string();
+    let inputs = InstallInputs::resolve(&resolved_config, &cfg, &identity, binary_override)?;
+    let unit_path = service_unit_path(&project_id)?;
+    write_unit_file(&unit_path, &inputs)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "wrote service unit: {}", unit_path.display())?;
+    print_install_hint(&mut out, &project_id, &unit_path)
+}
+
+fn write_unit_file(unit_path: &Path, inputs: &InstallInputs) -> Result<()> {
+    if let Some(parent) = unit_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating service unit directory {}", parent.display()))?;
+    }
+    let rendered = if cfg!(target_os = "macos") {
+        render_macos_plist(inputs)
+    } else {
+        render_linux_unit(inputs)
+    };
+    fs::write(unit_path, rendered).with_context(|| format!("writing {}", unit_path.display()))?;
+    Ok(())
+}
+
+fn print_install_hint(out: &mut impl Write, project_id: &str, unit_path: &Path) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let label = launchd_label(project_id);
+        writeln!(out)?;
+        writeln!(
+            out,
+            "to load (idempotent — bootout first if already loaded):"
+        )?;
+        writeln!(
+            out,
+            "  launchctl bootout gui/$(id -u)/{label} 2>/dev/null; \\"
+        )?;
+        writeln!(
+            out,
+            "  launchctl bootstrap gui/$(id -u) {}",
+            unit_path.display()
+        )?;
+    } else {
+        writeln!(out)?;
+        writeln!(out, "to load:")?;
+        writeln!(
+            out,
+            "  systemctl --user daemon-reload && systemctl --user enable --now {}",
+            systemd_unit_name(project_id)
+        )?;
+    }
+    Ok(())
+}
+
+/// Remove the service unit file from disk and print the operator command to
+/// unload it. Same headless-safe split as `run_install_service`.
+fn run_uninstall_service(config: &Path) -> Result<()> {
+    let (cfg, resolved_config) = SchemaConfig::resolve(Some(config))?;
+    let identity = ProjectIdentity::resolve(
+        &cfg.project.name,
+        &SchemaConfig::project_root(&resolved_config)?,
+    )?;
+    let project_id = identity.id.to_string();
+    let unit_path = service_unit_path(&project_id)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    print_uninstall_hint(&mut out, &project_id)?;
+    if unit_path.exists() {
+        fs::remove_file(&unit_path).with_context(|| format!("removing {}", unit_path.display()))?;
+        writeln!(out, "removed service unit: {}", unit_path.display())?;
+    } else {
+        writeln!(out, "service unit absent: {}", unit_path.display())?;
+    }
+    Ok(())
+}
+
+fn print_uninstall_hint(out: &mut impl Write, project_id: &str) -> Result<()> {
+    if cfg!(target_os = "macos") {
+        let label = launchd_label(project_id);
+        writeln!(out, "to unload first (idempotent):")?;
+        writeln!(out, "  launchctl bootout gui/$(id -u)/{label} 2>/dev/null")?;
+    } else {
+        writeln!(out, "to disable + stop first:")?;
+        writeln!(
+            out,
+            "  systemctl --user disable --now {}",
+            systemd_unit_name(project_id)
+        )?;
+    }
+    Ok(())
+}
+
+/// Print URL + lifecycle hints for the running per-project server.
+fn run_service_status(config: &Path) -> Result<()> {
+    let (cfg, resolved_config) = SchemaConfig::resolve(Some(config))?;
+    let identity = ProjectIdentity::resolve(
+        &cfg.project.name,
+        &SchemaConfig::project_root(&resolved_config)?,
+    )?;
+    let endpoint_path = identity.cache_dir.join("endpoint.toml");
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "project    : {}", identity.id)?;
+    writeln!(out, "cache dir  : {}", identity.cache_dir.display())?;
+    writeln!(out, "endpoint   : {}", endpoint_path.display())?;
+    match Endpoint::load(&endpoint_path) {
+        Ok(endpoint) => {
+            writeln!(out, "status     : RUNNING")?;
+            writeln!(out, "  url      : {}", endpoint.url)?;
+            writeln!(out, "  pid      : {}", endpoint.pid)?;
+            writeln!(out, "  started  : {}", endpoint.started_at)?;
+            writeln!(
+                out,
+                "  token    : <redacted; run `schema mcp-config` to see it>"
+            )?;
+        }
+        Err(e) => {
+            writeln!(out, "status     : NOT RUNNING ({e})")?;
+        }
+    }
+    Ok(())
+}
+
+/// Print the `mcpServers` JSON fragment for the running server.
+fn run_mcp_config(config: &Path) -> Result<()> {
+    let (cfg, resolved_config) = SchemaConfig::resolve(Some(config))?;
+    let identity = ProjectIdentity::resolve(
+        &cfg.project.name,
+        &SchemaConfig::project_root(&resolved_config)?,
+    )?;
+    let snippet = render_mcp_config_fragment(&identity)?;
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    writeln!(out, "{{")?;
+    writeln!(out, "  \"mcpServers\": {{")?;
+    writeln!(out, "{snippet}")?;
+    writeln!(out, "  }}")?;
+    writeln!(out, "}}")?;
     Ok(())
 }

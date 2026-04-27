@@ -1,32 +1,48 @@
 //! `SchemaServer` — driving adapter that exposes [`crate::app`] services
-//! over the MCP protocol via rmcp + stdio.
+//! over the MCP protocol via rmcp's Streamable HTTP transport (ADR-0019).
 //!
 //! Tools are registered via the `#[tool_router]` macro attribute. Each tool is
 //! an `async fn` (or sync `fn`) on the server impl block decorated with
-//! `#[tool(description = "...")]`.
+//! `#[tool(description = "...")]`. The HTTP transport is mounted by
+//! [`build_router`] which composes [`StreamableHttpService`] from rmcp with
+//! the `axum` router, the bearer-token auth layer (ADR-0021), the
+//! sensitive-headers redaction layer, and a `TraceLayer` for request spans.
 //!
 //! FASE 1.0 exposes:
-//!   - `ping`             smoke test
-//!   - `query`            generic top-K RAG
-//!   - `find_decisions`   query restricted to kind = adr-madr
-//!   - `glossary_lookup`  query restricted to kind = glossary
-//!   - `cross_reference`  `artifact_id` → referencing chunks
-//!   - `list_corpus`      debug listing
-//!   - `reset_index`      DESTRUCTIVE — wipe index + manifest (ADR-0015)
-//!   - `forget_source`    DESTRUCTIVE — drop one source path (ADR-0015)
+//!   - `ping`               smoke test
+//!   - `workspace_context`  "where am I?" — project + corpus + embedding (ADR-0009 amendment)
+//!   - `query`              generic top-K RAG
+//!   - `find_decisions`     query restricted to kind = adr-madr
+//!   - `glossary_lookup`    query restricted to kind = glossary
+//!   - `cross_reference`    `artifact_id` → referencing chunks
+//!   - `list_corpus`        debug listing
+//!   - `reset_index`        DESTRUCTIVE — wipe index + manifest (ADR-0015)
+//!   - `forget_source`      DESTRUCTIVE — drop one source path (ADR-0015)
 
+use std::iter;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
-use rmcp::transport::stdio;
-use rmcp::{ServiceExt, handler::server::wrapper::Parameters, schemars, tool, tool_router};
+use axum::Router;
+use axum::routing::get;
+use http::header;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
+};
+use rmcp::{handler::server::wrapper::Parameters, schemars, tool, tool_router};
 use serde::{Deserialize, Serialize};
+use tokio_util::sync::CancellationToken;
+use tower_http::sensitive_headers::SetSensitiveRequestHeadersLayer;
+use tower_http::trace::TraceLayer;
+use tower_http::validate_request::ValidateRequestHeaderLayer;
 use tracing::info;
 
+use crate::adapters::auth::BearerValidator;
 use crate::adapters::project_identity::ProjectIdentity;
 use crate::adapters::toml_config::SchemaConfig;
 use crate::app::cleanup::Cleanup;
 use crate::app::query::Query;
+use crate::app::synthesize::{Citation, Synthesize, SynthesizeOutput};
 use crate::domain::ChunkRecord;
 
 /// Empty parameter set — `ping` takes no arguments.
@@ -36,6 +52,138 @@ use crate::domain::ChunkRecord;
     reason = "schemars/serde derive shapes JSON `{}`, not `null`; converting to a unit struct would change MCP request schema"
 )]
 pub struct PingParams {}
+
+/// Empty parameter set — `workspace_context` takes no arguments.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[expect(
+    clippy::empty_structs_with_brackets,
+    reason = "schemars/serde derive shapes JSON `{}`, not `null`; converting to a unit struct would change MCP request schema"
+)]
+pub struct WorkspaceContextParams {}
+
+/// Reply for `workspace_context` — answers "where am I?".
+///
+/// The LLM does not have to guess project boundaries (ADR-0009 amendment,
+/// motivated by ADR-0023 walk-up + ENV overlay making the active config
+/// non-obvious). Per ADR-0025 the `llm` slice tells the calling LLM
+/// whether the `synthesize` MCP tool is wired (provider + model) or
+/// disabled (no API key configured).
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct WorkspaceContext {
+    pub project: ProjectContext,
+    pub corpus: Vec<CorpusEntry>,
+    pub embedding: EmbeddingContext,
+    pub llm: LlmContext,
+}
+
+/// LLM provider availability surfaced by `workspace_context`.
+/// `active = false` ⇒ `synthesize` is registered but disabled and
+/// will return an error if called (ADR-0025 §"silent degrade evidence").
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct LlmContext {
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+/// Project identity slice surfaced by `workspace_context`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ProjectContext {
+    pub name: String,
+    pub id: String,
+    pub version: String,
+    pub root: String,
+    pub cache_dir: String,
+}
+
+/// One entry from `[[corpus]]` in `schema.toml`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct CorpusEntry {
+    pub path: String,
+    pub kind: String,
+}
+
+/// Embedding model + output dimension surfaced by `workspace_context`.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct EmbeddingContext {
+    pub model: String,
+    pub dims: usize,
+}
+
+/// Arguments for the `synthesize` MCP tool (ADR-0025).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SynthesizeParams {
+    /// Natural-language question to answer over the indexed corpus.
+    /// Example: "What did ADR-0019 decide about transport?".
+    pub query: String,
+
+    /// How many retrieval hits to include in the synthesis prompt
+    /// before calling the LLM. Default 8. Lower (3-5) for tightly-
+    /// focused questions to save tokens; higher (12-16) for
+    /// exploratory questions where the answer needs wider context.
+    /// Hard-clamped to 1..=16.
+    #[serde(default)]
+    pub top_k: Option<usize>,
+}
+
+/// Reply shape for `synthesize` (ADR-0025).
+///
+/// Mirrors `crate::app::synthesize::SynthesizeOutput` 1-to-1; declared
+/// in this adapter so the JSON schema sits next to the rmcp tool
+/// registration and ADR-0016 lives close to the schema.
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SynthesizeResult {
+    pub answer: String,
+    pub model: String,
+    pub citations: Vec<SynthesizeCitation>,
+    pub usage: SynthesizeUsage,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SynthesizeCitation {
+    pub source_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_id: Option<String>,
+    pub line_start: i32,
+    pub line_end: i32,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct SynthesizeUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+}
+
+impl From<SynthesizeOutput> for SynthesizeResult {
+    fn from(value: SynthesizeOutput) -> Self {
+        let citations = value.citations.into_iter().map(Into::into).collect();
+        let usage = SynthesizeUsage {
+            input_tokens: value.input_tokens,
+            output_tokens: value.output_tokens,
+        };
+        Self {
+            answer: value.answer,
+            model: value.model,
+            citations,
+            usage,
+        }
+    }
+}
+
+impl From<Citation> for SynthesizeCitation {
+    fn from(value: Citation) -> Self {
+        Self {
+            source_path: value.source_path,
+            artifact_id: value.artifact_id,
+            line_start: value.line_start,
+            line_end: value.line_end,
+        }
+    }
+}
 
 /// Arguments for the generic `query` tool.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -167,6 +315,10 @@ pub struct ServerState {
     pub identity: ProjectIdentity,
     pub query: Query,
     pub cleanup: Cleanup,
+    /// `Some` when ADR-0025 [`LlmProvider`](crate::ports::LlmProvider) is
+    /// wired (Anthropic / `OpenAI`); `None` triggers the `synthesize`
+    /// runtime-disabled path.
+    pub synthesize: Option<Synthesize>,
 }
 
 /// The MCP server instance.
@@ -179,6 +331,57 @@ pub struct SchemaServer {
 
 #[tool_router(server_handler)]
 impl SchemaServer {
+    /// Reports the project this MCP server is bound to, so the LLM
+    /// (Claude Code) can orient itself when ENV overrides or
+    /// `.mcp.json` misconfiguration would otherwise leave it
+    /// guessing (ADR-0009 amendment, motivated by ADR-0023).
+    #[tool(
+        description = "Returns project context for this schema MCP server: project name + id + version, project root path, cache directory, registered corpus paths, and embedding model. Useful as a sanity check at session start ('what am I connected to?') and for debugging .mcp.json wiring. No arguments."
+    )]
+    async fn workspace_context(&self, _params: Parameters<WorkspaceContextParams>) -> String {
+        use crate::adapters::fastembed_embedder::BGE_M3_DIMENSIONS;
+
+        let state = &self.state;
+        let project = ProjectContext {
+            name: state.config.project.name.clone(),
+            id: state.identity.id.to_string(),
+            version: state.config.project.version.clone(),
+            root: state.identity.root.display().to_string(),
+            cache_dir: state.identity.cache_dir.display().to_string(),
+        };
+        let corpus: Vec<CorpusEntry> = state
+            .config
+            .corpus
+            .iter()
+            .map(|c| CorpusEntry {
+                path: c.path.display().to_string(),
+                kind: format!("{:?}", c.kind),
+            })
+            .collect();
+        let embedding = EmbeddingContext {
+            model: state.config.embedding.model.clone(),
+            dims: BGE_M3_DIMENSIONS,
+        };
+        let llm = state.synthesize.as_ref().map_or(
+            LlmContext {
+                active: false,
+                provider: None,
+                model: None,
+            },
+            |synth| LlmContext {
+                active: true,
+                provider: Some(synth.provider_name().to_string()),
+                model: Some(synth.model()),
+            },
+        );
+        json_or_error(&WorkspaceContext {
+            project,
+            corpus,
+            embedding,
+            llm,
+        })
+    }
+
     /// Smoke-test tool. Returns the literal string `"pong"`.
     #[tool(description = "Liveness probe; returns 'pong'. Use as a connectivity smoke test.")]
     #[expect(
@@ -334,6 +537,31 @@ impl SchemaServer {
             Err(e) => format_error(&format!("{e}")),
         }
     }
+
+    /// `synthesize` — RAG answering over the indexed corpus (ADR-0025).
+    ///
+    /// Description must follow ADR-0016 style: action verb opening +
+    /// concrete example + differentiation hint + availability note.
+    /// Tool count is 8-or-9: when no `*_API_KEY` is set, the call
+    /// returns an error envelope; `workspace_context.llm.active` is
+    /// the canonical signal the calling LLM checks before invoking.
+    #[tool(
+        description = "Answer a natural-language question over the indexed corpus by retrieving the top semantically-similar chunks and composing a cited answer through a configured cloud LLM (Anthropic Claude or OpenAI GPT). Returns {answer, citations[], model, usage}; each citation carries source_path, line range, and optional artifact_id (e.g. \"ADR-0019\"). Example call: synthesize {\"query\": \"How does ADR-0019 handle session liveness?\", \"top_k\": 6} → narrative answer plus 2-3 citations into the actual ADR file. Differs from `query`, `find_decisions`, `glossary_lookup` (which return raw chunks for the **calling** LLM to read) — use `synthesize` when the caller wants a ready answer, not chunks; use the retrieval tools when the caller wants to read the source material directly. Requires a provider API key (ANTHROPIC_API_KEY or OPENAI_API_KEY) at server startup; check `workspace_context.llm.active = true` before calling. When disabled, this tool returns an error envelope explaining how to enable it. One outbound HTTPS call to the configured provider per invocation."
+    )]
+    async fn synthesize(&self, Parameters(params): Parameters<SynthesizeParams>) -> String {
+        let Some(synth) = self.state.synthesize.as_ref() else {
+            return format_error(
+                "synthesize is disabled: set ANTHROPIC_API_KEY or OPENAI_API_KEY \
+                 (or [llm] provider = \"anthropic\" / \"openai\" with the \
+                 matching key) and restart schema serve.",
+            );
+        };
+        let top_k = params.top_k.unwrap_or(8).clamp(1, 16);
+        match synth.run(&params.query, top_k).await {
+            Ok(output) => json_or_error(&SynthesizeResult::from(output)),
+            Err(e) => format_error(&format!("{e}")),
+        }
+    }
 }
 
 /// Serialise any `Serialize` value to JSON; on failure return a JSON-encoded
@@ -358,17 +586,69 @@ impl SchemaServer {
             state: Arc::new(state),
         }
     }
+}
 
-    /// Run the MCP server over stdio until the client disconnects.
-    ///
-    /// # Errors
-    /// Returns an error if rmcp fails to bind the stdio transport or the
-    /// service exits abnormally.
-    pub async fn run_stdio(self) -> Result<()> {
-        info!("starting schema MCP server (stdio transport)");
-        let service = self.serve(stdio()).await?;
-        service.waiting().await?;
-        info!("schema MCP server shut down cleanly");
-        Ok(())
-    }
+/// Trivial `200 OK` health probe handler.
+///
+/// Mounted at `GET /health` *without* the bearer-auth layer so external
+/// supervisors (launchd, systemd, smoke scripts) can probe liveness without
+/// needing the token. Body is empty by design — the endpoint must not leak
+/// project name, token, or any cache path.
+async fn health_handler() -> &'static str {
+    ""
+}
+
+/// Compose the full `axum::Router` for the HTTP MCP transport (ADR-0019).
+///
+/// Layout:
+/// - `POST /mcp` mounts rmcp's `StreamableHttpService`, gated by
+///   [`BearerValidator`] (ADR-0021).
+/// - `GET /health` unauthenticated liveness probe.
+///
+/// Cross-cutting layers (applied to the *whole* router so trace spans cover
+/// `/health` too):
+/// - [`SetSensitiveRequestHeadersLayer`] marks `Authorization` sensitive,
+///   so [`TraceLayer`] never serialises the bearer token to logs.
+/// - [`TraceLayer::new_for_http`] emits one `tracing` span per request.
+///
+/// `cancellation_token` is the token rmcp's session loop watches; cancelling
+/// it from the caller (graceful SIGTERM) drains in-flight sessions.
+pub fn build_router(
+    server: SchemaServer,
+    token: String,
+    cancellation_token: CancellationToken,
+) -> Router {
+    info!("building HTTP MCP router (Streamable HTTP transport, ADR-0019)");
+
+    // ADR-0019 §"Session liveness" — values match
+    // `StreamableHttpServerConfig::default()` from rmcp 1.5; pinned
+    // explicitly here so a reader sees the contract without diving into
+    // the rmcp source. Changing any of these is a behaviour change that
+    // belongs in the ADR.
+    let config = StreamableHttpServerConfig::default()
+        .with_cancellation_token(cancellation_token)
+        .with_sse_keep_alive(Some(Duration::from_secs(15)))
+        .with_sse_retry(Some(Duration::from_secs(3)))
+        .with_stateful_mode(true)
+        .with_allowed_hosts(["localhost", "127.0.0.1", "::1"]);
+    let mcp_service = StreamableHttpService::new(
+        move || Ok(server.clone()),
+        Arc::new(LocalSessionManager::default()),
+        config,
+    );
+
+    let mcp_router =
+        Router::new()
+            .nest_service("/mcp", mcp_service)
+            .layer(ValidateRequestHeaderLayer::custom(BearerValidator::new(
+                token,
+            )));
+
+    Router::new()
+        .merge(mcp_router)
+        .route("/health", get(health_handler))
+        .layer(SetSensitiveRequestHeadersLayer::new(iter::once(
+            header::AUTHORIZATION,
+        )))
+        .layer(TraceLayer::new_for_http())
 }

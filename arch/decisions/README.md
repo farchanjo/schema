@@ -23,7 +23,7 @@ pointing at the CI check that proves the decision is still in effect.
 | #    | Title                                                                                  | Status   | Date       |
 | ---- | -------------------------------------------------------------------------------------- | -------- | ---------- |
 | 0001 | [Rust + Cargo for the schema binary](./0001-rust-cargo-mcp.md)                          | accepted | 2026-04-25 |
-| 0002 | [rmcp 1.5 over stdio for MCP transport](./0002-rmcp-stdio.md)                           | accepted | 2026-04-25 |
+| 0002 | [rmcp 1.5 over stdio for MCP transport](./0002-rmcp-stdio.md)                           | superseded by 0019 | 2026-04-25 |
 | 0003 | [Multi-project architecture (one binary, many consumers)](./0003-multi-project-architecture.md) | accepted | 2026-04-25 |
 | 0004 | [Config-driven projects via `schema.toml`](./0004-config-driven-projects.md)            | accepted | 2026-04-25 |
 | 0005 | [bge-m3 via fastembed for text embeddings](./0005-fastembed-bge-m3.md)                  | accepted | 2026-04-25 |
@@ -38,3 +38,12 @@ pointing at the CI check that proves the decision is still in effect.
 | 0014 | [Install at `/usr/local/bin` + Apple codesign on macOS](./0014-install-and-codesign.md)  | accepted | 2026-04-25 |
 | 0015 | [Cleanup tools at both MCP and CLI surfaces](./0015-cleanup-tools.md)                     | accepted | 2026-04-25 |
 | 0016 | [MCP tool description style: verb + example + safety hint](./0016-mcp-tool-description-style.md) | accepted | 2026-04-25 |
+| 0017 | [`mtime + size` short-circuit before `blake3` hash](./0017-mtime-size-shortcircuit.md) | accepted | 2026-04-26 |
+| 0018 | [Embedder CPU cap via process nice](./0018-cap-onnx-threads.md) | accepted | 2026-04-26 |
+| 0019 | [MCP transport: Streamable HTTP via `rmcp` 1.5 + `axum` 0.8](./0019-http-streamable-transport.md) | accepted (supersedes 0002; atomic accept set with 0020+0021) | 2026-04-26 |
+| 0020 | [Permanent service lifecycle: launchd + systemd, one per project](./0020-service-permanent-lifecycle.md) | accepted | 2026-04-26 |
+| 0021 | [Localhost bind + per-project bearer-token auth](./0021-localhost-bearer-auth.md) | accepted | 2026-04-26 |
+| 0022 | [Bench-driven evaluation of `tokio-uring` (D-3, Linux only)](./0022-tokio-uring-bench-evaluation.md) | accepted (gate) | 2026-04-26 |
+| 0023 | [Config resolution: walk-up + ENV overlay](./0023-env-overlay-and-walk-up-config-resolution.md) | accepted | 2026-04-26 |
+| 0024 | [E2E test category in Python (pytest + httpx)](./0024-e2e-tests-python-pytest.md) | accepted | 2026-04-26 |
+| 0025 | [LLM `synthesize` tool + `LlmProvider` port (Anthropic / OpenAI)](./0025-llm-synthesize-tool-and-provider-port.md) | accepted | 2026-04-26 |

@@ -17,17 +17,45 @@ path = "src/main.rs"
 
 [dependencies]
 # MCP — Model Context Protocol Rust SDK
-# Features required:
-#   server        — server-side handler infrastructure
-#   macros        — #[tool] and #[tool_router] attribute macros
-#   transport-io  — stdio transport (rmcp::transport::stdio)
-rmcp = { version = "1.5", features = ["server", "macros", "transport-io"] }
+# Features required (post-ADR-0019):
+#   server                            — server-side handler infrastructure
+#   macros                            — #[tool] and #[tool_router] attribute macros
+#   transport-streamable-http-server  — Streamable HTTP server transport
+# `transport-io` (stdio) is **dropped** per ADR-0019 — the binary no longer
+# speaks stdio; one HTTP server per project (ADR-0020) replaces N stdio
+# subprocesses.
+rmcp = { version = "1.5", features = [
+    "server",
+    "macros",
+    "transport-streamable-http-server",
+] }
 
 # Async runtime
 # `test-util` powers `tokio::test(start_paused = true)` and
 # `tokio::time::advance(...)` in the watcher consumer's debounce tests.
 tokio = { version = "1.52", features = ["full", "test-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 futures = "0.3"
+
+# HTTP MCP transport stack (ADR-0019, ADR-0021).
+# axum 0.8 + tower 0.5 + tower-http 0.6 are the upstream-paired versions
+# (axum 0.8.x's own Cargo.toml lists `tower-http = "0.6.8"`).
+axum       = "0.8"
+tower      = "0.5"
+tower-http = { version = "0.6", features = [
+    "validate-request",   # ValidateRequestHeaderLayer::custom for bearer auth
+    "trace",              # TraceLayer for request spans
+    "sensitive-headers",  # SetSensitiveRequestHeadersLayer to redact Authorization
+] }
+http             = "1"
+http-body-util   = "0.1"
+bytes            = "1"
+uuid             = { version = "1", features = ["v4"] }
+
+# HTTPS client for cloud LLM adapters (ADR-0025). Pin to 0.12 to
+# dedup with the version pulled in transitively by `fastembed`/`hf-hub`;
+# rustls-tls keeps the build OpenSSL-free across macOS / Linux.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 # `async-trait` enables `async fn` in `dyn Trait` ports under stable Rust.
 # Per ADR-0013, port traits use `#[async_trait]` so adapters can be wired

@@ -249,3 +249,102 @@ pub trait MetadataStore: Send + Sync {
     /// Returns an error if the manifest cannot be written.
     fn reset(&self) -> Result<(), MetadataStoreError>;
 }
+
+// ─── LlmProvider (ADR-0025) ──────────────────────────────────────────────
+
+/// Outbound port driving a cloud LLM for the `synthesize` MCP tool.
+///
+/// Implementations live in `crate::adapters::{anthropic_provider,
+/// openai_provider}`. Only the composition root knows which concrete
+/// adapter is wired; the [`crate::app::synthesize::Synthesize`] use case
+/// holds an `Arc<dyn LlmProvider>` and never imports either adapter.
+///
+/// When no adapter is wired (no `*_API_KEY` set), the MCP `synthesize`
+/// tool is hidden from `tools/list` per ADR-0025 §"silent degrade".
+#[async_trait]
+pub trait LlmProvider: Send + Sync {
+    /// Provider identifier surfaced in `workspace_context` and
+    /// `synthesize` responses (`"anthropic"` / `"openai"`).
+    fn name(&self) -> &'static str;
+
+    /// Resolved model id (e.g. `"claude-haiku-4-5-20251001"`,
+    /// `"gpt-5"`) used by this provider. May come from `[llm].model`,
+    /// `SCHEMA_LLM_MODEL`, or the per-provider compiled-in default.
+    fn model(&self) -> &str;
+
+    /// One-shot synthesis call. Maps `req` → provider HTTPS POST →
+    /// returns the parsed response.
+    ///
+    /// Implementations must:
+    /// - never log API keys, prompts, or responses at `info` or above
+    /// - timeout at 60 s and return `LlmError::Timeout`
+    /// - return `LlmError::Unauthorized` on HTTP 401/403
+    /// - return `LlmError::Backend` on any other transport failure
+    ///
+    /// # Errors
+    /// Returns the variant of [`LlmError`] matching the failure mode.
+    async fn synthesize(&self, req: SynthesisRequest) -> Result<SynthesisResponse, LlmError>;
+}
+
+/// Input to [`LlmProvider::synthesize`]. Built by the `Synthesize` use
+/// case after retrieving and packing the chunks.
+///
+/// `temperature` and `max_tokens` are `Option` so the adapter can
+/// substitute its own provider-specific default when the operator did
+/// not pin a value. ADR-0025 §"Provider-specific defaults" amendment
+/// (2026-04-27) moves the defaults into the outbound adapters because
+/// each provider's accepted range differs (e.g. gpt-5 rejects
+/// `temperature = 0.0` and burns `max_tokens` on reasoning).
+#[derive(Debug, Clone)]
+pub struct SynthesisRequest {
+    /// System prompt — instructs the LLM how to behave (cite-only,
+    /// refuse-on-empty-context, prompt-injection defence). Same shape
+    /// across providers.
+    pub system_prompt: String,
+    /// User prompt — the natural-language question plus the
+    /// retrieval context block.
+    pub user_prompt: String,
+    /// Cap on output tokens. `None` ⇒ use the adapter's
+    /// `DEFAULT_MAX_TOKENS` constant (Anthropic 1024, `OpenAI` 8192).
+    pub max_tokens: Option<u32>,
+    /// Sampling temperature. `None` ⇒ use the adapter's
+    /// `DEFAULT_TEMPERATURE` constant (Anthropic 0.0, `OpenAI` 1.0).
+    pub temperature: Option<f32>,
+}
+
+/// Output from [`LlmProvider::synthesize`]. The use case wraps the
+/// `answer` field with citation rows derived from the retrieval hits.
+#[derive(Debug, Clone)]
+pub struct SynthesisResponse {
+    /// Free-text answer produced by the LLM.
+    pub answer: String,
+    /// Resolved model id (echoed for trace/debug; client may rely on
+    /// it for caching keys).
+    pub model: String,
+    /// Tokens billed for the input prompt, when the provider returns
+    /// it. `None` when the provider doesn't expose usage in this call.
+    pub input_tokens: Option<u32>,
+    /// Tokens billed for the output. `None` semantics same as above.
+    pub output_tokens: Option<u32>,
+}
+
+#[derive(Debug, Error)]
+pub enum LlmError {
+    #[error("llm provider {provider} timed out after {timeout_secs}s")]
+    Timeout {
+        provider: &'static str,
+        timeout_secs: u64,
+    },
+    #[error("llm provider {provider} rejected the credentials (HTTP {status})")]
+    Unauthorized { provider: &'static str, status: u16 },
+    #[error("llm provider {provider} backend error: {message}")]
+    Backend {
+        provider: &'static str,
+        message: String,
+    },
+    #[error("llm provider {provider} returned an unexpected payload: {message}")]
+    Decode {
+        provider: &'static str,
+        message: String,
+    },
+}

@@ -126,34 +126,51 @@ cargo fmt --all -- --check      # CI-style format check
 cargo clippy --all-targets --all-features -- -D warnings   # lint, warn = error
 ```
 
-## Install + codesign on macOS (ADR-0014)
+## Install + codesign on macOS (ADR-0014, revised 2026-04-26)
 
-The `schema` binary is **installed at `/usr/local/bin/schema`** and
-**codesigned with the operator's Apple Development identity**. This is
+The `schema` binary is **installed at `/usr/local/bin/schema`**.
+Codesign is **optional** but recommended on macOS — without it, the
+binary still runs but Gatekeeper warns once on first launch. This is
 not the Cargo default (`~/.cargo/bin/`) — it is the project's deliberate
 choice per ADR-0014 to guarantee `PATH` resolution from any Claude Code
-spawn context and to produce a Gatekeeper-friendly signature that
-survives moving the binary between Macs.
+spawn context.
 
 **Canonical install / upgrade procedure** (run from the repo root):
 
 ```bash
 cargo build --release
-codesign --sign "Apple Development: Fabricio Fonseca (J3LVNXCU3U)" \
-         --options runtime \
-         --force \
-         target/release/schema
 sudo install -m 0755 target/release/schema /usr/local/bin/schema
+sudo codesign --sign "Apple Development: Fabricio Fonseca (J3LVNXCU3U)" \
+              --options runtime \
+              --force \
+              /usr/local/bin/schema
 codesign --verify --verbose=2 /usr/local/bin/schema
 schema --version
 ```
 
+- `sudo install` lands the binary at the final path first.
+- `sudo codesign` signs **in place** at `/usr/local/bin/schema`. Signing
+  the cargo output and then `install`-copying introduces filesystem-
+  attribute / `com.apple.quarantine` race conditions on certain
+  APFS/SMB combinations; signing under sudo at the destination is
+  atomic and inherits no quarantine.
 - `--options runtime` enables the **Hardened Runtime**.
-- `sudo install` is atomic (replaces the file in one step; running
-  Claude Code sessions continue using the old binary in memory until
-  they restart).
 - The verify step is the **fitness function** of ADR-0014; it must
   exit 0 and show the developer's identity in the Authority chain.
+
+**Without an Apple identity:**
+
+```bash
+cargo build --release
+sudo install -m 0755 target/release/schema /usr/local/bin/schema
+# Skip codesign. Gatekeeper warns once; clear with:
+xattr -d com.apple.quarantine /usr/local/bin/schema   # or right-click → Open
+```
+
+Service mode (`schema install --service`, ADR-0020) is more reliable
+with a codesigned binary; without codesign, the rendered LaunchAgent
+plist may need the Hardened Runtime expectation removed (drop
+`--options runtime`) on future macOS releases.
 
 **Do not** use `cargo install --path .` for this project — it lands in
 `~/.cargo/bin/` (ad-hoc-signed only, `PATH` order ambiguity, no
