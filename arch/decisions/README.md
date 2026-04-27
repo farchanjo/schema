@@ -52,3 +52,4 @@ pointing at the CI check that proves the decision is still in effect.
 | 0028 | [Kind-aware retrieval via `sqlite-vec` partition key + per-project score floor](./0028-kind-aware-retrieval-and-score-floor.md) | accepted | 2026-04-27 |
 | 0029 | [bge-m3 query/passage prefix policy with gradual per-project rollout](./0029-bge-m3-asymmetric-prefix-policy.md) | accepted | 2026-04-27 |
 | 0030 | [Stable consumer-side MCP wiring: `.mcp.json` policy + `schema mcp-shim`](./0030-stable-consumer-mcp-wiring.md) | accepted | 2026-04-27 |
+| 0031 | [Secret management for the schema daemon (LLM provider keys)](./0031-secret-management-for-daemon.md) | accepted | 2026-04-27 |
