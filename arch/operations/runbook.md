@@ -461,13 +461,19 @@ ls -lh ~/.cache/schema/projects/<id>/store.db
 
 ## Migration to ADR-0026 (shared daemon)
 
-> **Status (2026-04-26):** ADR-0026 is `accepted` (direction
-> locked). Code lands behind a fitness-function gate (two-
-> project canary E2E). Per-project units installed under
-> ADR-0020 keep running in production until the shared daemon
-> ships and that gate is green. **Operators take no action
-> yet.** This section is the migration plan, written ahead of
-> the code, so the cutover is mechanical when it lands.
+> **Status (2026-04-27): partially superseded by ADR-0027.**
+> ADR-0026's drivers (single ONNX, ADR-0008 isolation,
+> provable cross-project isolation) carry over. The
+> routing/membership specifics in this section
+> (`schema project register / unregister / list`,
+> `registry.toml`, per-project `endpoint.toml` / mounts /
+> tokens) are **superseded by ADR-0027**: directory IS the
+> source of truth, single `/mcp` mount, single workstation
+> bearer, lazy resolve via `working_directory`. **Use the
+> "Migration to ADR-0027" section below for the live
+> cutover plan.** This section is retained for historical
+> reference of what ADR-0026 originally proposed; do not
+> follow its 8-step cutover.
 
 ### What changes
 
@@ -661,6 +667,190 @@ ls -lh ~/.cache/schema/projects/<id>/store.db
   Σ-of-old-daemons** — unexpected; means per-project
   retention got worse, not better. ADR-0027 (memory budget,
   follow-up to ADR-0026) is the place to track this.
+
+## Migration to ADR-0027 (single endpoint + lazy resolve)
+
+> **Status (2026-04-27):** ADR-0027 is `accepted`. Refactor
+> PRs #1–4 have landed on `main`. The canary fitness function
+> (`tests/e2e/test_adr0027_isolation.py`) is the **merge gate
+> for the cutover** — running it green on the operator's box
+> before flipping `.mcp.json` to the daemon URL is the only
+> remaining manual step. Once green, the per-project
+> `schema serve` units installed under ADR-0019 / ADR-0020
+> can be replaced with **one** workstation-level
+> `schema daemon` unit.
+
+### What changes (vs. ADR-0019 today)
+
+| Artefact | Before (ADR-0019) | After (ADR-0027) |
+|----------|-------------------|------------------|
+| Process count | N (one `schema serve --config <path>` per project) | 1 (one `schema daemon`, no `--config`) |
+| ONNX session in RAM | N × ~1.7 GB | 1 × ~1.7 GB (shared) |
+| launchd / systemd unit | N × `com.farchanjo.schema.<project_id>` | 1 × `com.farchanjo.schema.daemon` |
+| Project membership | implicit per unit (`--config <path>`) | implicit per request (`working_directory` parameter) |
+| URL surface | N (one `/mcp` per process, different ports) | 1 (`/mcp` on one port, **one** workstation bearer) |
+| `endpoint.toml` | N (per project, at `~/.cache/schema/projects/<id>/endpoint.toml`) | 1 global at `~/Library/Application Support/schema/endpoint.toml` (macOS) / `~/.local/state/schema/endpoint.toml` (Linux) |
+| Consumer `.mcp.json` | per-project (each carrying its own URL + bearer) | **one** for the workstation (every project shares it) — Claude Code passes `working_directory` per tool call |
+| Bearer token | N (one per project) | 1 (workstation) |
+| `schema.toml` discovery | explicit (`--config <path>`) | walk-up from `working_directory` |
+| Reset | `schema reset --config <path>` (CLI) **or** `reset_index { working_directory }` (MCP) | same MCP shape; CLI variant unchanged |
+
+### What does **not** change
+
+- ADR-0008 cache directory layout — every resolved project
+  still owns one `~/.cache/schema/projects/<project_id>/
+  store.db`. The daemon never opens two stores in the same
+  query; cross-bleed is impossible by physical layout.
+- ADR-0014 — binary still installed once at
+  `/usr/local/bin/schema` and codesigned once.
+- ADR-0019 transport — Streamable HTTP via rmcp + axum,
+  `LocalSessionManager`, `with_stateful_mode(true)`,
+  localhost-only allowed hosts, SIGTERM drain.
+- ADR-0021 token secrecy — UUIDv4 per restart, `0600` on
+  `endpoint.toml`, localhost-bound.
+- ADR-0024 E2E test runner — the canary fitness function
+  in `tests/e2e/test_adr0027_isolation.py` lives in the
+  same suite.
+
+### Cutover sequence (operator, when ready)
+
+> Numbered steps run **in order** to avoid a window where
+> neither the per-project units nor the daemon serves a
+> project.
+
+1. **Update `schema` to a build that contains ADR-0027
+   refactor PRs #1–#4 (main = `<sha>`).**
+
+   ```bash
+   cd ~/dev/mcp-schema
+   git pull
+   cargo build --release
+   sudo install -m 0755 target/release/schema /usr/local/bin/schema
+   sudo codesign --sign "Apple Development: Fabricio Fonseca (J3LVNXCU3U)" \
+                 --options runtime --force /usr/local/bin/schema
+   schema --version
+   ```
+
+2. **Run the canary E2E on the operator's box**
+   (cold model cache: 5–15 min; warm: ~30–90 s).
+
+   ```bash
+   cd ~/dev/mcp-schema/tests/e2e
+   pytest -v -m slow test_adr0027_isolation.py
+   ```
+
+   All 6 tests must pass. If any fails, **abort the
+   cutover** and file an incident — cross-project bleed is
+   the one condition where ADR-0027 says "stop, do not
+   paper over".
+
+3. **Inventory the per-project ADR-0019 units running
+   today.**
+
+   ```bash
+   # macOS:
+   launchctl list | grep com.farchanjo.schema
+   # Linux:
+   systemctl --user list-units 'schema-*' --no-legend
+   ```
+
+   Save the list. The `~/.cache/schema/projects/<id>/`
+   trees are **untouched** by the cutover — those stay on
+   disk and the new daemon reads them as soon as the
+   matching `schema.toml` is resolved.
+
+4. **Stop and remove the per-project ADR-0019 units.**
+
+   ```bash
+   # macOS, per project_id:
+   launchctl bootout gui/$(id -u)/com.farchanjo.schema.<project_id>
+   schema uninstall --service --config <project>/schema.toml
+
+   # Linux, per project_id:
+   systemctl --user disable --now schema-<project_id>.service
+   schema uninstall --service --config <project>/schema.toml
+   ```
+
+5. **Install the workstation-level daemon unit.** *(Slice 5
+   delivers a unit template that invokes `schema daemon`;
+   until then run the daemon under your terminal-of-choice
+   or via a one-off launchd / systemd unit you author by
+   hand. The shape is `ProgramArguments = ["schema",
+   "daemon"]`, no `--config` flag.)*
+
+   ```bash
+   # macOS (manual one-off; slice 5 templates the official
+   # plist):
+   /usr/local/bin/schema daemon &
+
+   # Or persistent: write a one-off
+   # ~/Library/LaunchAgents/com.farchanjo.schema.daemon.plist
+   # whose ProgramArguments = ["/usr/local/bin/schema",
+   # "daemon"], then `launchctl bootstrap gui/$(id -u) <plist>`.
+   ```
+
+6. **Refresh consumer `.mcp.json`.** Every project the
+   operator works in shares **one** `.mcp.json` pointing at
+   the global daemon endpoint:
+
+   ```bash
+   cat ~/Library/Application\ Support/schema/endpoint.toml
+   # → url = "http://127.0.0.1:<port>/mcp"
+   #   token = "<UUIDv4>"
+   #
+   # Paste into ~/.claude/mcp_servers.json (workstation-level)
+   # or into per-project .mcp.json files. The same URL +
+   # token works for every project — project scoping happens
+   # per tool call via the working_directory parameter.
+   ```
+
+7. **Open Claude Code in each project; first MCP tool call
+   triggers `Daemon::resolve_or_wire`.** Cold sync: slow
+   (~30–60 s typical, more for large corpora). Subsequent
+   calls hit the warm cache. The watcher is spawned at
+   wire time; edits propagate without a daemon restart
+   (ADR-0010 recovery shipped in PR #4).
+
+8. **Rollback** (if anything in steps 5–7 fails):
+
+   ```bash
+   # Stop the daemon:
+   launchctl bootout gui/$(id -u)/com.farchanjo.schema.daemon
+   # Or just `pkill schema` if running under terminal.
+
+   # Reinstall per-project ADR-0019 units (the old plists
+   # were deleted in step 4; rerun install verb per
+   # project):
+   for cfg in ~/dev/mcp-schema/schema.toml ~/dev/lowcow-platform/schema.toml \
+              ~/dev/alloy-spec2/schema.toml ~/dev/alloy-specs/schema.toml; do
+     schema install --service --config "$cfg"
+   done
+   # Then bootstrap each per-project unit (see "Configure a
+   # consumer project" above).
+   ```
+
+   `~/.cache/schema/projects/*/` is untouched throughout —
+   no re-embed required on rollback. Per-project bearer
+   tokens regenerate on each `schema serve` restart per
+   ADR-0021, so per-project `.mcp.json` files need to be
+   re-rendered with `schema mcp-config` after rollback.
+
+### Red flags during ADR-0027 migration
+
+- **Canary E2E fails (any test in
+  `test_adr0027_isolation.py`)** — abort cutover. Do not
+  paper over with a workaround. Cross-project bleed is the
+  one contract ADR-0027 protects.
+- **Daemon log shows `no schema.toml found walking up
+  from <path>`** — operator's `working_directory` does not
+  resolve to a project. Either create a `schema.toml` at
+  the project root or call `workspace_context` from a
+  subdirectory of an existing project.
+- **First tool call hangs for minutes** — expected on a
+  fresh project (cold delta-sync inline). Subsequent calls
+  hit the warm cache. ADR-0027 §"Open questions —
+  initial-sync timeout" tracks the UX answer; if it's
+  blocking real work, surface to the operator.
 
 ## Uninstall
 

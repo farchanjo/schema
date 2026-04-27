@@ -57,7 +57,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::adapters::project_identity::{ProjectId, ProjectIdentity};
 use crate::adapters::toml_config::SchemaConfig;
-use crate::app::project_instance::ProjectInstance;
+use crate::app::project_instance::{ProjectInstance, spawn_project_watcher};
 use crate::ports::{Embedder, LlmProvider};
 
 /// Per-workstation daemon. See module docs.
@@ -162,6 +162,23 @@ impl Daemon {
             self.llm_provider.clone(),
         )
         .await?;
+        // Initial delta-sync inline so the warm cache is in place by
+        // the time the tool call's response goes out (ADR-0027 §"Open
+        // questions" — initial-sync timeout). Cheap on warm restart
+        // per ADR-0017's `mtime + size` short-circuit; slow only on a
+        // truly fresh project.
+        let initial = instance.sync.clone().run().await?;
+        tracing::info!(
+            project = %instance.identity.id,
+            ?initial,
+            "daemon: initial delta-sync complete",
+        );
+        // ADR-0010 watcher recovery for daemon mode (ADR-0027 PR 4/4
+        // Evidence). Without this the lazy-wired projects would not
+        // pick up edits while the daemon is running — only a daemon
+        // restart would refresh them.
+        spawn_project_watcher(&instance)?;
+
         let arc = Arc::new(instance);
         // Double-check pattern: another concurrent request may have
         // wired the same project between our `lookup` read-lock

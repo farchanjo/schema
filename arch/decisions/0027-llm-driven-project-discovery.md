@@ -539,7 +539,58 @@ answer to the same question.
     `cli/project.rs` tests). 5 integration. Strict-lint
     gate green; `cargo fmt --all -- --check` clean.
 
-- **2026-04-27 — refactor PR #3 of 4 landed (this commit).**
+- **2026-04-27 — refactor PR #4 of 4 landed (this commit).**
+  Daemon-mode watcher recovery + ADR-0019 / ADR-0020 /
+  ADR-0021 forward-pointing amendments + runbook cutover
+  sequence. Closes the ADR-0027 refactor loop.
+  - `src/app/project_instance.rs`: `spawn_project_watcher`
+    (extracted from `main::spawn_watcher`) is the single
+    helper both deployment shapes call. Lives next to
+    `ProjectInstance::wire` so the application layer owns
+    the watcher lifecycle.
+  - `src/app/daemon.rs`: `wire_and_insert` now (a) runs the
+    initial delta-sync inline so warm-cache reads land
+    behind a populated `store.db` by the time the tool
+    response goes out, and (b) calls `spawn_project_watcher`
+    so ADR-0010 in-session edits propagate without a daemon
+    restart. The regression flagged in PR #2's Evidence is
+    closed.
+  - `src/main.rs`: `spawn_watcher` deleted (moved to
+    `spawn_project_watcher`); `WATCHER_DEBOUNCE` constant
+    deleted (moved next to the helper). `run_serve` calls
+    `spawn_project_watcher(&project)` directly.
+  - **ADR-0019 / ADR-0020 / ADR-0021 amendments appended**
+    forward-pointing to ADR-0027:
+    - ADR-0019: process-shape part further amended —
+      single `/mcp` mount + single workstation bearer
+      replaces ADR-0026's URL-path routing.
+    - ADR-0020: per-project shape further amended —
+      `schema project register / unregister / list` and
+      `registry.toml` superseded by directory-as-source-
+      of-truth.
+    - ADR-0021: validator shape **reverted** —
+      `MultiTenantBearerValidator` /
+      `ProjectTokenRegistry` removed; single-token
+      `BearerValidator` is sufficient again.
+  - `arch/decisions/README.md`: 0019 / 0020 / 0021 status
+    rows updated to "amended by 0026 + 0027"; 0026 row
+    updated to "partially superseded by 0027 (routing/
+    membership specifics; drivers preserved)".
+  - `arch/operations/runbook.md`: ADR-0026 "Migration"
+    section marked partially superseded; new "Migration
+    to ADR-0027 (single endpoint + lazy resolve)"
+    section delivers the live cutover sequence (8 steps:
+    update binary → run canary E2E → inventory →
+    bootout per-project → install daemon → refresh
+    `.mcp.json` → smoke per project → rollback).
+  - `daemon` subcommand description rewritten from "ADR-0026
+    multi-mount" to "ADR-0027 single mount, lazy resolve".
+  - 89 unit + 5 integration tests pass (no test churn —
+    watcher spawn is exercised by the canary E2E from
+    PR #3, not by Rust unit tests). Strict-lint gate
+    green; `cargo fmt --all -- --check` clean.
+
+- **2026-04-27 — refactor PR #3 of 4 landed.**
   Canary fitness function E2E. `tests/e2e/test_adr0027_isolation.py`
   exercises the cutover gate from §"Fitness function".
   - `_spawn_daemon` spawns `schema daemon` with `HOME=<tmp>` so the

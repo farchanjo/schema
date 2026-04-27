@@ -393,3 +393,20 @@ friction. Both shapes live in `arch/operations/`.
   200-with-empty-results. Implementation gated on the fitness
   function. See ADR-0026 §"Decision" and ADR-0026 §"Fitness
   function".
+
+- **2026-04-27 — validator shape reverted by ADR-0027.**
+  ADR-0026's `Map<TokenHash, ProjectId>` multi-tenant
+  validator is itself superseded by ADR-0027. Single-token
+  `BearerValidator` is sufficient again because routing is
+  now single-mount (`/mcp`) and project scoping happens
+  per tool call via the `working_directory` parameter rather
+  than by URL path or token. The
+  `MultiTenantBearerValidator` + `ProjectTokenRegistry`
+  helpers ADR-0026 introduced have been removed from the
+  tree. Token rotation per restart, `0600` `endpoint.toml`
+  mode (now **one global** `endpoint.toml` per ADR-0027,
+  not N per project), localhost-only bind,
+  `SetSensitiveRequestHeadersLayer` ordering, and the
+  constant-time-comparison follow-up are **all preserved**
+  — they apply to the workstation bearer. See ADR-0027
+  §"Decision" and ADR-0027 §"Slice rollback / refactor plan".
