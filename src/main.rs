@@ -43,6 +43,7 @@ use schema::adapters::registry_toml::Registry;
 use schema::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_dir};
 use schema::adapters::toml_config::SchemaConfig;
 use schema::app::cleanup::Cleanup;
+use schema::app::daemon::{Daemon, ProjectSlot};
 use schema::app::delta_sync::{DeltaSync, corpus_paths_from_config};
 use schema::app::project_instance::ProjectInstance;
 use schema::app::watcher_consumer::run_watcher_consumer;
@@ -85,6 +86,22 @@ fn cli() -> Command {
         .subcommand(service_subcommand(config_arg.clone()))
         .subcommand(mcp_config_subcommand(config_arg.clone()))
         .subcommand(project_subcommand(config_arg))
+        .subcommand(daemon_subcommand())
+}
+
+/// `schema daemon` — start the shared multi-project daemon (ADR-0026).
+///
+/// Reads the project registry from `Registry::default_path()`, wires
+/// every project against one shared `Embedder`, binds one localhost
+/// port, and serves `/mcp/<project_id>` for every registered project.
+/// No `--config` flag — project membership is the registry's job per
+/// ADR-0026 amendment to ADR-0020.
+fn daemon_subcommand() -> Command {
+    Command::new("daemon").about(
+        "Start the shared multi-project MCP daemon (ADR-0026). Reads the project registry from \
+         the platform-default path; mounts /mcp/<project_id> for every registered project, gated \
+         by per-project bearer tokens.",
+    )
 }
 
 /// `schema project register / unregister / list` (ADR-0026 amendment of ADR-0020).
@@ -276,6 +293,7 @@ async fn main() -> Result<()> {
         },
         Some(("mcp-config", sub)) => run_mcp_config(&config_from(sub)),
         Some(("project", sub)) => run_project(sub),
+        Some(("daemon", _)) => run_daemon().await,
         Some((other, _)) => Err(anyhow::anyhow!("unknown subcommand: {other}")),
         None => run_serve(PathBuf::from("schema.toml")).await,
     }
@@ -422,6 +440,127 @@ async fn serve_http(server: SchemaServer, endpoint_path: PathBuf) -> Result<()> 
     cleanup_endpoint_file(&endpoint_path);
 
     serve_result
+}
+
+/// `schema daemon` — start the shared multi-project daemon (ADR-0026 slice 4b).
+///
+/// Reads the project registry from `Registry::default_path()`, wires
+/// every project against one shared `Embedder`, binds **one** localhost
+/// port, mounts `/mcp/<project_id>` for every project (each gated by
+/// the project's bearer), runs initial delta-sync + watcher per
+/// project, and writes a per-project `endpoint.toml` pointing at the
+/// shared URL with the project's path and token. On SIGTERM / Ctrl-C
+/// the in-flight sessions are drained and every `endpoint.toml` is
+/// removed.
+async fn run_daemon() -> Result<()> {
+    let registry_path = Registry::default_path()?;
+    let registry = Registry::load(&registry_path)
+        .with_context(|| format!("loading registry at {}", registry_path.display()))?;
+    if registry.is_empty() {
+        tracing::warn!(
+            registry = %registry_path.display(),
+            "no projects registered; daemon will serve /health only — \
+             register projects with `schema project register --config <path>`",
+        );
+    }
+
+    let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3()?));
+    let llm_provider = resolve_llm_provider_for_daemon()?;
+
+    let daemon = Daemon::wire(&registry, embedder, llm_provider).await?;
+    tracing::info!(project_count = daemon.len(), "daemon: projects wired");
+    serve_daemon(daemon).await
+}
+
+/// Bind the listener, run startup side effects per slot, build the
+/// router, serve until shutdown, then clean up `endpoint.toml` files.
+/// Split out of `run_daemon` to keep both functions under the
+/// 30-line cognitive-complexity budget.
+async fn serve_daemon(daemon: Daemon) -> Result<()> {
+    let listener = bind_localhost_listener().await?;
+    let bound = listener.local_addr()?;
+    tracing::info!(address = %bound, "daemon HTTP listener bound");
+
+    let endpoint_paths = startup_each_slot(&daemon, &bound).await?;
+
+    let cancellation = CancellationToken::new();
+    let router = daemon.into_router(&cancellation);
+    let serve_result = run_axum_until_shutdown(listener, router, cancellation).await;
+
+    for path in &endpoint_paths {
+        cleanup_endpoint_file(path);
+    }
+    serve_result
+}
+
+/// Per-slot startup side effects: write `endpoint.toml`, run initial
+/// delta-sync, spawn the watcher loop. Order matches the
+/// single-project `wire_serve_services` contract — `endpoint.toml`
+/// is written **after** initial sync so the file's existence implies
+/// the daemon is ready to serve queries.
+async fn startup_each_slot(daemon: &Daemon, bound: &SocketAddr) -> Result<Vec<PathBuf>> {
+    let mut endpoint_paths = Vec::with_capacity(daemon.slots.len());
+    for slot in &daemon.slots {
+        let endpoint_path = slot.instance.identity.cache_dir.join("endpoint.toml");
+        slot.instance.sync.clone().run().await?;
+        tracing::info!(
+            project = %slot.project_id,
+            "daemon: initial delta-sync complete",
+        );
+        spawn_watcher(
+            &slot.instance.config,
+            &slot.instance.identity,
+            slot.instance.sync.clone(),
+        )?;
+        write_daemon_endpoint_file(&endpoint_path, bound, slot)?;
+        endpoint_paths.push(endpoint_path);
+    }
+    Ok(endpoint_paths)
+}
+
+/// Write a per-project `endpoint.toml` pointing at the shared
+/// daemon's URL with the project's path segment and bearer.
+fn write_daemon_endpoint_file(path: &Path, bound: &SocketAddr, slot: &ProjectSlot) -> Result<()> {
+    let endpoint = Endpoint {
+        version: 1,
+        url: format!("http://{bound}/mcp/{}", slot.project_id),
+        token: slot.token.clone(),
+        pid: process::id(),
+        started_at: Utc::now().to_rfc3339(),
+    };
+    endpoint.write_atomic(path)?;
+    tracing::info!(
+        project = %slot.project_id,
+        path = %path.display(),
+        "daemon: endpoint.toml written (mode 0600)",
+    );
+    Ok(())
+}
+
+/// LLM provider resolution for the shared daemon. Reads
+/// `[llm].provider` indirectly via `SCHEMA_LLM_PROVIDER` env var
+/// (the registry has no `[llm]` section — that's per-project and
+/// would conflict if two projects pinned different providers).
+/// `auto` is the default; explicit pinning is via the env knob,
+/// matching ADR-0023's overlay semantics.
+fn resolve_llm_provider_for_daemon() -> Result<Option<Arc<dyn LlmProvider>>> {
+    use std::env;
+    let provider = env::var("SCHEMA_LLM_PROVIDER").unwrap_or_else(|_| "auto".to_string());
+    let model = env::var("SCHEMA_LLM_MODEL").unwrap_or_default();
+    let anthropic_key = env::var("ANTHROPIC_API_KEY").ok().filter(|s| !s.is_empty());
+    let openai_key = env::var("OPENAI_API_KEY").ok().filter(|s| !s.is_empty());
+    match provider.as_str() {
+        "none" => {
+            tracing::info!("daemon llm: provider=none — synthesize tool disabled across projects");
+            Ok(None)
+        }
+        "anthropic" => build_anthropic(anthropic_key, model, "explicit"),
+        "openai" => build_openai(openai_key, model, "explicit"),
+        "auto" => resolve_auto(anthropic_key, openai_key, model),
+        other => Err(anyhow::anyhow!(
+            "SCHEMA_LLM_PROVIDER={other:?} is not supported (use anthropic / openai / none / auto)"
+        )),
+    }
 }
 
 async fn bind_localhost_listener() -> Result<TcpListener> {

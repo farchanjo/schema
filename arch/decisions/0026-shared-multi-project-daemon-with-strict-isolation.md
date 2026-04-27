@@ -580,6 +580,81 @@ e2e job.
       BETA-CANARY) — the **merge gate** for any commit
       that flips the operator-facing path from ADR-0019
       per-project to ADR-0026 shared.
+
+- **2026-04-26 — slice 4b landed (PR #5, this commit).**
+  `schema daemon` CLI verb + runtime entry point. The
+  shared daemon now runs end-to-end against a registry,
+  but the operator-facing deployment still defaults to
+  ADR-0019 per-project units until slice 5 (template
+  collapse) and slice 6 (canary E2E gate) ship.
+  - `src/main.rs`: new `daemon` subcommand (no
+    `--config` flag — registry is the source of truth
+    per ADR-0026 amendment to ADR-0020). `run_daemon`
+    loads the registry from `Registry::default_path()`,
+    builds **one** `FastembedEmbedder` (BGE-M3 ONNX
+    session — the ~1.7 GB workstation baseline ADR-0026
+    is built around), resolves the LLM provider from
+    env (`SCHEMA_LLM_PROVIDER` / `SCHEMA_LLM_MODEL` /
+    `*_API_KEY`), and calls `Daemon::wire`. An empty
+    registry logs a warning but still serves
+    `/health`-only — operators can register projects
+    after start-up, and a future hot-reload admin
+    endpoint (slice 4c) will pick them up without a
+    restart.
+  - `serve_daemon` binds `127.0.0.1:0`, runs per-slot
+    startup side effects, builds the multi-tenant
+    router, runs `axum::serve` with the shared
+    `CancellationToken` (one SIGTERM drains every
+    in-flight session in parallel), then unlinks every
+    `endpoint.toml` it wrote.
+  - `startup_each_slot` for each `ProjectSlot`: runs
+    initial delta-sync, spawns the per-project
+    `NotifyWatcher` (ADR-0010), and writes the
+    project's `endpoint.toml` at
+    `~/.cache/schema/projects/<project_id>/
+    endpoint.toml` with `url = "http://127.0.0.1:<port>
+    /mcp/<project_id>"` and `token = <slot's UUIDv4
+    bearer>`. The URL **includes** the project's path
+    segment — consumers can paste it directly into
+    `.mcp.json` (ADR-0021 fitness function: file mode
+    is still `0600`, written via tempfile + rename).
+  - `resolve_llm_provider_for_daemon` reads
+    `SCHEMA_LLM_PROVIDER` / `SCHEMA_LLM_MODEL` from
+    env (the registry has no `[llm]` section — that
+    knob is per-project today and would conflict if
+    two projects pinned different providers; the
+    daemon's shared provider is workstation-level by
+    construction). Default is `auto`, matching the
+    single-project resolver.
+  - `cli/install.rs`, `cli/templates/launchd.plist
+    .template`, and `cli/templates/systemd.service
+    .template` are **untouched** in this slice. They
+    still render per-project units. Slice 5 collapses
+    them to a single workstation-level unit invoking
+    `schema daemon`.
+  - 110 unit tests still pass (no behavioural drift
+    in single-project paths). Manual smoke:
+    `schema daemon --help` prints the new verb's
+    description; `schema --help` lists `daemon`
+    alongside `serve` / `validate` / `project` / etc.
+    Strict-lint gate green; `cargo fmt --all --
+    --check` clean.
+  - Open work blocking cutover:
+    - **Slice 4c (deferred)**: hot-reload admin
+      endpoint at `POST /admin/projects/refresh` so
+      `schema project register / unregister` apply
+      without a daemon restart.
+    - **Slice 5**: template collapse — workstation-
+      level launchd plist / systemd unit invoking
+      `schema daemon`, no per-project `{project_id}`
+      slot.
+    - **Slice 6**: canary E2E (`tests/e2e/
+      test_adr0026_isolation.py`). With slice 4b
+      shipped, the test fixture can finally spin up
+      the real daemon binary and assert ALPHA-CANARY /
+      BETA-CANARY isolation against
+      `/mcp/<project_a_id>` and `/mcp/<project_b_id>`.
+
 - **2026-04-26 — diagnostic that motivated this ADR.**
   Four daemons resident on the operator's box per
   `vmmap --summary`:
