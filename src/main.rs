@@ -34,8 +34,7 @@ use uuid::Uuid;
 use schema::adapters::anthropic_provider::AnthropicProvider;
 use schema::adapters::endpoint_toml::Endpoint;
 use schema::adapters::fastembed_embedder::FastembedEmbedder;
-use schema::adapters::filesystem::{NotifyWatcher, WalkdirWalker};
-use schema::adapters::markdown_chunker::MarkdownChunker;
+use schema::adapters::filesystem::NotifyWatcher;
 use schema::adapters::mcp_server::{SchemaServer, ServerState, build_router};
 use schema::adapters::metadata_store::TomlMetadataStore;
 use schema::adapters::openai_provider::OpenAiProvider;
@@ -45,15 +44,14 @@ use schema::adapters::sqlite_vec_store::{SqliteVecStore, migrate_legacy_lance_di
 use schema::adapters::toml_config::SchemaConfig;
 use schema::app::cleanup::Cleanup;
 use schema::app::delta_sync::{DeltaSync, corpus_paths_from_config};
-use schema::app::query::Query;
-use schema::app::synthesize::Synthesize;
+use schema::app::project_instance::ProjectInstance;
 use schema::app::watcher_consumer::run_watcher_consumer;
 use schema::cli::install::{
     InstallInputs, launchd_label, render_linux_unit, render_macos_plist,
     render_mcp_config_fragment, systemd_unit_name,
 };
 use schema::cli::project as cli_project;
-use schema::ports::{Chunker, Embedder, LlmProvider, MetadataStore, Persistence, Walker, Watcher};
+use schema::ports::{Embedder, LlmProvider, MetadataStore, Persistence, Watcher};
 
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(500);
 
@@ -294,98 +292,6 @@ fn init_tracing() {
         .init();
 }
 
-/// Bundle of port handles wired up for one project.
-struct Wiring {
-    persistence: Arc<dyn Persistence>,
-    embedder: Arc<Mutex<dyn Embedder>>,
-    walker: Arc<dyn Walker>,
-    chunker: Arc<dyn Chunker>,
-    metadata: Arc<dyn MetadataStore>,
-}
-
-async fn wire_ports(cfg: &SchemaConfig, identity: &ProjectIdentity) -> Result<Wiring> {
-    // Persistence: SqliteVecStore (ADR-0011).
-    migrate_legacy_lance_dir(&identity.cache_dir);
-    let persistence: Arc<dyn Persistence> =
-        Arc::new(SqliteVecStore::open(&identity.store_path).await?);
-    persistence.ensure_ready().await?;
-
-    // Embedder: fastembed BGE-M3 (ADR-0005).
-    let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3()?));
-
-    // Walker + Chunker + MetadataStore — all sync, all wrapped in Arc<dyn>.
-    let cfg_arc = Arc::new(cfg.clone());
-    let walker: Arc<dyn Walker> = Arc::new(WalkdirWalker::new(cfg_arc, identity.root.clone()));
-    let chunker: Arc<dyn Chunker> = Arc::new(MarkdownChunker::new(cfg.retrieval.chunk_size_max));
-    let metadata: Arc<dyn MetadataStore> =
-        Arc::new(TomlMetadataStore::new(identity.metadata_path.clone()));
-
-    Ok(Wiring {
-        persistence,
-        embedder,
-        walker,
-        chunker,
-        metadata,
-    })
-}
-
-/// Built application services for one running session.
-struct Services {
-    sync: DeltaSync,
-    query: Query,
-    cleanup: Cleanup,
-    /// `Some` when a cloud LLM provider (Anthropic / `OpenAI`) is wired
-    /// per ADR-0025; `None` triggers the runtime gate on the
-    /// `synthesize` MCP tool (`[DISABLED — set ANTHROPIC_API_KEY or
-    /// OPENAI_API_KEY]`).
-    synthesize: Option<Synthesize>,
-}
-
-fn build_services(cfg: &SchemaConfig, wiring: &Wiring) -> Result<Services> {
-    let sync = DeltaSync::new(
-        Arc::clone(&wiring.persistence),
-        Arc::clone(&wiring.embedder),
-        Arc::clone(&wiring.walker),
-        Arc::clone(&wiring.chunker),
-        Arc::clone(&wiring.metadata),
-    );
-    let query = Query::new(
-        Arc::clone(&wiring.persistence),
-        Arc::clone(&wiring.embedder),
-    );
-    let cleanup = Cleanup::new(
-        Arc::clone(&wiring.persistence),
-        Arc::clone(&wiring.metadata),
-    );
-    let synthesize = build_synthesize(cfg, wiring)?;
-    Ok(Services {
-        sync,
-        query,
-        cleanup,
-        synthesize,
-    })
-}
-
-/// Composition root for the LLM `synthesize` use case (ADR-0025).
-///
-/// Resolves the provider per the rules in ADR-0025 §"Composition root
-/// selection": explicit `[llm].provider` selector when set, otherwise
-/// auto-detect via `*_API_KEY`. `none` (or `auto` with neither key
-/// set) yields `None` — the synthesize tool then runs in disabled
-/// mode at the MCP layer.
-fn build_synthesize(cfg: &SchemaConfig, wiring: &Wiring) -> Result<Option<Synthesize>> {
-    let Some(provider) = resolve_llm_provider(cfg)? else {
-        return Ok(None);
-    };
-    Ok(Some(Synthesize::new(
-        Arc::clone(&wiring.persistence),
-        Arc::clone(&wiring.embedder),
-        provider,
-        cfg.llm.max_tokens,
-        cfg.llm.temperature,
-    )))
-}
-
 /// Pick the concrete `LlmProvider` adapter implementing ADR-0025's
 /// selection rules. Returns `None` when no provider is configured
 /// or when the explicit `[llm].provider = "none"` is set.
@@ -456,14 +362,14 @@ fn resolve_auto(
 
 async fn run_serve(config: PathBuf) -> Result<()> {
     let (cfg, identity) = resolve_serve_context(&config)?;
-    let services = wire_serve_services(&cfg, &identity).await?;
-    let endpoint_path = identity.cache_dir.join("endpoint.toml");
+    let project = wire_serve_services(cfg, identity).await?;
+    let endpoint_path = project.identity.cache_dir.join("endpoint.toml");
     let state = ServerState {
-        config: cfg,
-        identity,
-        query: services.query,
-        cleanup: services.cleanup,
-        synthesize: services.synthesize,
+        config: project.config,
+        identity: project.identity,
+        query: project.query,
+        cleanup: project.cleanup,
+        synthesize: project.synthesize,
     };
     serve_http(SchemaServer::with_state(state), endpoint_path).await
 }
@@ -483,13 +389,17 @@ fn resolve_serve_context(config: &Path) -> Result<(SchemaConfig, ProjectIdentity
     Ok((cfg, identity))
 }
 
-async fn wire_serve_services(cfg: &SchemaConfig, identity: &ProjectIdentity) -> Result<Services> {
-    let wiring = wire_ports(cfg, identity).await?;
-    let services = build_services(cfg, &wiring)?;
-    let initial = services.sync.run().await?;
+async fn wire_serve_services(
+    cfg: SchemaConfig,
+    identity: ProjectIdentity,
+) -> Result<ProjectInstance> {
+    let embedder: Arc<Mutex<dyn Embedder>> = Arc::new(Mutex::new(FastembedEmbedder::new_bge_m3()?));
+    let llm_provider = resolve_llm_provider(&cfg)?;
+    let project = ProjectInstance::wire(cfg, identity, &embedder, llm_provider).await?;
+    let initial = project.sync.run().await?;
     tracing::info!(?initial, "initial delta-sync complete");
-    spawn_watcher(cfg, identity, services.sync.clone())?;
-    Ok(services)
+    spawn_watcher(&project.config, &project.identity, project.sync.clone())?;
+    Ok(project)
 }
 
 /// Start the Streamable HTTP MCP server (ADR-0019).
@@ -645,11 +555,17 @@ async fn build_cleanup(config: &Path) -> Result<(ProjectIdentity, Cleanup)> {
         &SchemaConfig::project_root(&resolved_config)?,
     )?;
     identity.ensure_cache_dir()?;
-    let wiring = wire_ports(&cfg, &identity).await?;
-    let cleanup = Cleanup::new(
-        Arc::clone(&wiring.persistence),
-        Arc::clone(&wiring.metadata),
-    );
+    // Cleanup needs only persistence + metadata — skip the embedder /
+    // walker / chunker that `ProjectInstance::wire` would build, since
+    // a one-shot `reset` / `forget` should not pay the ~2 GB ONNX
+    // load cost.
+    migrate_legacy_lance_dir(&identity.cache_dir);
+    let persistence: Arc<dyn Persistence> =
+        Arc::new(SqliteVecStore::open(&identity.store_path).await?);
+    persistence.ensure_ready().await?;
+    let metadata: Arc<dyn MetadataStore> =
+        Arc::new(TomlMetadataStore::new(identity.metadata_path.clone()));
+    let cleanup = Cleanup::new(persistence, metadata);
     Ok((identity, cleanup))
 }
 

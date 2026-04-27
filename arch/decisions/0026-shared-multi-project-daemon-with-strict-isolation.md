@@ -411,6 +411,111 @@ e2e job.
   "Migration to ADR-0026 (shared daemon)" section.
   Implementation pending the prototype + fitness function
   gate; no production code yet on the shared-daemon path.
+
+- **2026-04-26 — slice 1 + 2a landed (PR #1, merged as
+  `bdc4616` on `main`).** Additive scaffolding for the
+  shared-daemon path; no production runtime touched.
+  - `src/adapters/auth.rs`: new `MultiTenantBearerValidator`
+    + `ProjectTokenRegistry`. The validator resolves
+    `bearer → ProjectId` via the shared registry and
+    injects the resolved id into the request's
+    `extensions_mut()` so the eventual router can
+    dispatch by project. Lock poisoning recovers via
+    `PoisonError::into_inner` (registry holds only owned
+    `String` / `ProjectId` values; recovery is strictly
+    safer than crashing the daemon for every other
+    registered project). The single-token
+    `BearerValidator` is **retained unchanged** for the
+    ADR-0019 / ADR-0020 per-project daemon path that
+    ships in production today.
+  - `src/adapters/registry_toml.rs`: `Registry` /
+    `ProjectEntry` reader/writer. Path conventions per
+    ADR-0026 amendment to ADR-0020 (`~/Library/Application
+    Support/schema/registry.toml` on macOS,
+    `~/.local/state/schema/registry.toml` on Linux).
+    `load` treats missing-file as empty (fresh-install
+    case). `save_atomic` writes via tempfile + rename at
+    the default `0644` (file holds paths and ids only —
+    bearer tokens stay in per-project `endpoint.toml` at
+    `0600`, ADR-0021).
+  - 14 unit tests added (97 → 105 in `cargo test
+    --all-features`). `cargo clippy --all-features
+    --all-targets --workspace -- -D warnings` exits 0;
+    `cargo fmt --all -- --check` clean.
+
+- **2026-04-26 — slice 3 landed (PR #2, merged as
+  `55f1f37` on `main`).** Operator-facing CLI surface for
+  the registry. Filesystem-only (the daemon picks up
+  changes on next restart; hot-reload via a localhost
+  admin endpoint is a follow-up slice; production runtime
+  unchanged).
+  - `src/cli/project.rs`: `register / unregister / list`
+    verbs operating on `Registry::default_path()`.
+    `register` resolves identity from the consumer's
+    `schema.toml`, canonicalises the absolute path,
+    upserts, saves; re-register replaces in place
+    (preserves order, rotates `registered_at`).
+    `unregister` is idempotent — missing `project_id` is
+    a non-fatal warning at exit code 0. `list` prints in
+    insertion order; empty registry message is explicit.
+  - `src/main.rs`: `project` subcommand wired with three
+    sub-verbs; `Registry::default_path()` resolved once
+    per invocation so the daemon and the CLI agree on
+    the registry location without an extra flag.
+  - 7 unit tests added (105 → 112). Manual smoke:
+    `schema project list` on a fresh box prints
+    `no projects registered (~/Library/Application
+    Support/schema/registry.toml)`; `schema project
+    --help` lists the three verbs. Strict-lint gate
+    green; `cargo fmt --all -- --check` clean.
+
+- **2026-04-26 — slice 2b landed (PR #3, this commit).**
+  Composition-root refactor: `Wiring + Services` (private
+  to `main.rs`) replaced with a single named, file-resident
+  `ProjectInstance` in `src/app/project_instance.rs`.
+  - `ProjectInstance` aggregates per-project ports
+    (`Persistence`, `MetadataStore`, `Walker`, `Chunker`)
+    and per-project app-layer use cases (`DeltaSync`,
+    `Query`, `Cleanup`, optional `Synthesize`). Hexagonal
+    placement: application-layer (`src/app/`); domain
+    untouched. ADR-0013 dependency rule preserved
+    (`adapters → application → domain`).
+  - `ProjectInstance::wire(config, identity, &embedder,
+    llm_provider)` accepts the embedder by reference, so
+    the same factory works in single-project mode
+    (`run_serve` builds one `Embedder` and passes it in)
+    and in shared-daemon mode (a future `Daemon` will
+    build one `Embedder` and pass the **same** `Arc`
+    clone to every registered project). The factory
+    splits into `WiredPorts::open` and
+    `WiredUseCases::build` to keep each function under
+    the 30-line cognitive budget.
+  - `main.rs`: `Wiring`, `Services`, `wire_ports`,
+    `build_services`, `build_synthesize` removed;
+    `wire_serve_services` rebuilt on
+    `ProjectInstance::wire`. `build_cleanup` (used by
+    `schema reset` / `schema forget`) inlines a
+    persistence + metadata wiring directly to **avoid**
+    paying the ~2 GB ONNX load cost a `ProjectInstance`
+    would imply for a one-shot cleanup.
+  - Manual `Debug` impl on `ProjectInstance` (the field
+    types include `Arc<dyn Trait>` whose traits do not
+    require `Debug`); `finish_non_exhaustive` documents
+    the partial display as intentional.
+  - 107 unit tests still passing — refactor preserves
+    all FASE 1.0 behaviour. Strict-lint gate green;
+    `cargo fmt --all -- --check` clean.
+
+- **2026-04-26 — fitness-function gate status.**
+  Implementation slices 1, 2a, 3, 2b have all landed
+  additively or as preserving refactors. The shared
+  daemon's runtime path (slice 4 — `Daemon` aggregator
+  + multi-tenant router; slice 6 — canary E2E
+  fitness function) is **not yet shipped**, so the
+  per-project ADR-0019 / ADR-0020 deployment remains
+  the production model. Cutover (per
+  `arch/operations/runbook.md` "Migration to ADR-0026")
+  is gated on slice 6 turning green in CI.
 - **2026-04-26 — diagnostic that motivated this ADR.**
   Four daemons resident on the operator's box per
   `vmmap --summary`:
