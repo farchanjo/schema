@@ -670,15 +670,22 @@ ls -lh ~/.cache/schema/projects/<id>/store.db
 
 ## Migration to ADR-0027 (single endpoint + lazy resolve)
 
-> **Status (2026-04-27):** ADR-0027 is `accepted`. Refactor
-> PRs #1–4 have landed on `main`. The canary fitness function
-> (`tests/e2e/test_adr0027_isolation.py`) is the **merge gate
-> for the cutover** — running it green on the operator's box
-> before flipping `.mcp.json` to the daemon URL is the only
-> remaining manual step. Once green, the per-project
-> `schema serve` units installed under ADR-0019 / ADR-0020
-> can be replaced with **one** workstation-level
-> `schema daemon` unit.
+> **Status (2026-04-27): live.** Cutover executed on the
+> operator's box. Canary fitness function ran 6/6 green in
+> 145 s; per-project `com.farchanjo.schema.<project_id>`
+> units booted out + uninstalled; workstation-level
+> `com.farchanjo.schema.daemon` plist installed and
+> bootstrapped (PID 50138, port 63357); global
+> `endpoint.toml` written at `~/Library/Application Support/
+> schema/endpoint.toml`; consumer `.mcp.json` files in
+> `~/dev/{lowcow-platform,alloy-spec2,alloy-specs}/`
+> repointed at the global URL + bearer; smoke
+> (`/health` 200, MCP `initialize` + `tools/list`) green.
+>
+> The sequence below is **the historical record + recovery
+> reference**. New operators (or re-installs after a clean
+> wipe) follow it; existing operators on this box are already
+> live.
 
 ### What changes (vs. ADR-0019 today)
 

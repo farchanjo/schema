@@ -517,6 +517,68 @@ answer to the same question.
   "accepted (impl gated)" to "accepted (live)" once green in
   CI on the cutover PR.
 
+- **2026-04-27 — accepted (live).** Cutover executed on
+  the operator's box. Sequence in
+  `arch/operations/runbook.md` "Migration to ADR-0027"
+  followed end-to-end; every step landed green.
+  - **Canary fitness gate**: `pytest -v -m slow
+    test_adr0027_isolation.py` → **6 passed in 145.68 s**
+    (warm model cache from operator's box). All six
+    isolation contracts proven end-to-end against the
+    real `target/release/schema` binary.
+  - **Binary refresh**: `target/release/schema` rebuilt
+    on `e53d5b7` and installed at
+    `/usr/local/bin/schema` per ADR-0014. Codesign
+    skipped this round (keychain unlock issue —
+    `errSecInternalComponent`); binary runs unsigned.
+    ADR-0014 §"Codesign is optional" documents this
+    fallback.
+  - **Per-project units retired**: 4 launchd units
+    (`com.farchanjo.schema.{home,lowcow-platform,
+    alloy-spec2,alloy-specs}-<hash>`) booted out and
+    plists removed via
+    `schema uninstall --service --config <path>`.
+  - **Daemon installed**:
+    `schema install --daemon` rendered
+    `~/Library/LaunchAgents/com.farchanjo.schema.daemon
+    .plist`; `launchctl bootstrap gui/$(id -u)
+    <plist>` brought it up at PID 50138 listening on
+    `127.0.0.1:63357/mcp`. Global `endpoint.toml`
+    written at `~/Library/Application Support/schema/
+    endpoint.toml`, mode `0600`.
+  - **Consumer `.mcp.json` files refreshed**:
+    `~/dev/{lowcow-platform,alloy-spec2,alloy-specs}/
+    .mcp.json` now point at the global URL + bearer.
+    `~/dev/mcp-schema/` keeps no `.mcp.json` (operator
+    runs Claude Code from there with the workstation-
+    level config).
+  - **Smoke verifications**:
+    - `curl /health` → 200.
+    - MCP initialize handshake returns
+      `mcp-session-id` header.
+    - `tools/list` returns 10 tools, every project-
+      scoped tool's `inputSchema` carries the new
+      `working_directory` required field.
+  - **Stale per-project `endpoint.toml` files**: not
+    present after cutover — SIGTERM during `bootout`
+    triggered the per-project servers' graceful-
+    shutdown handler (ADR-0019 evidence amendment
+    2026-04-26), which already removes
+    `endpoint.toml` on exit. Clean.
+  - **Per-project `~/.cache/schema/projects/<id>/
+    store.db` files preserved**. The daemon will
+    open them lazily on the first MCP tool call from
+    each project — no re-embed required, ADR-0017
+    `mtime + size` short-circuit covers warm restart.
+
+  Production now runs ADR-0027 end-to-end. ADR-0019
+  per-project model retired. Per-project
+  `endpoint.toml` files are obsolete (consumers point
+  at the workstation-level global file). ADR-0026's
+  "drivers preserved; routing/membership specifics
+  partially superseded by 0027" entry in
+  `arch/decisions/README.md` reflects the live state.
+
 - **2026-04-26 — refactor PR #1 of 4 landed.**
   Operator-facing CLI surface for the (now-superseded)
   registry deleted. ADR-0026 slice 3 reverted in full.
